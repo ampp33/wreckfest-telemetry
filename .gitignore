@@ -1,0 +1,4 @@
+config.json
+race_log.jsonl
+__pycache__/
+*.pyc
