@@ -14,6 +14,7 @@ the Wreckfest 2 Race Log backend automatically, in addition to --log-file.
 
 import argparse
 import array
+import glob
 import json
 import os
 import re
@@ -391,11 +392,63 @@ def _local_player_slot_index(f, table_base: int) -> Optional[int]:
     return raw if raw > -1 else 0
 
 
+def _read_player_native_only(f, d: dict) -> PlayerResult:
+    """Builds a player entry from the slot's own native fields (total time,
+    best lap, class rating, finished flag) -- independent of `player_ptr`'s
+    normal *struct-shaped* read, which can fail for the local player's own
+    slot specifically (confirmed live 2026-08-05: `player_ptr` pointed into
+    what looks like an unrelated engine string/name table rather than a
+    normal per-player struct -- persisted unchanged for the whole race, not
+    a timing/not-yet-populated issue). Only ever used as a fallback for the
+    CLIENT-recognized local slot, once the normal player_ptr-based
+    read_player() has already failed for it -- losing the local player's
+    actual finish position/time over one bad pointer would be far worse
+    than a placeholder (car gets filled in separately anyway, by
+    resolve_local_car_name(), which never depended on player_ptr at all).
+
+    Name specifically: still attempted at `ptr + POFF_NAME`, deliberately
+    *without* read_player()'s MIN_HEAP_PTR floor -- confirmed live that even
+    though the pointer fails that struct-validity check, the memory it
+    points to is still validly mapped and readable, and the name field
+    specifically read back correct and non-garbled (landing at the expected
+    offset in what's apparently a shared name-interning table rather than a
+    per-player struct, not by coincidence -- it was the real name, not some
+    other registered string). MIN_HEAP_PTR exists to reject *structurally*
+    invalid pointers (Wine low-memory stray values) before trusting a whole
+    struct's shape; a single string field is much lower-risk to attempt
+    even when that fuller trust isn't warranted, and `_looks_garbled()`
+    still catches an outright bad read."""
+    laps = [d['best_lap_ms']] if MIN_LAP_MS <= d['best_lap_ms'] <= MAX_LAP_MS else []
+    flag = ri32(f, d['addr'] + OFF_FINISHED_FLAG)
+    finished = bool(flag is not None and flag & FINISHED_BIT)
+
+    name = ""
+    ptr = ru64(f, d['addr'] + OFF_PLAYER_PTR)
+    if ptr:
+        candidate = rcstr(f, ptr + POFF_NAME, 64)
+        if candidate and not _looks_garbled(candidate):
+            name = candidate
+
+    return PlayerResult(
+        position=0, name=name, car="", engine="",
+        class_letter=class_from_rating(d['class_rating']),
+        class_rating=d['class_rating'], best_lap_ms=d['best_lap_ms'],
+        total_time_ms=d['total_time_ms'], lap_times_ms=laps, is_local=False,
+        finished=finished,
+    )
+
+
 def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int], pairs: list, slot0: Optional[int]) -> None:
-    """Marks the entry at the CLIENT-derived local slot index. Falls back to
-    lowest address (wrong in general, but only reachable if CLIENT can't resolve)."""
-    if not pairs:
-        return
+    """Marks the entry at the CLIENT-derived local slot index. If that slot
+    is real (passes validate_entry) but wasn't captured in `pairs` at all --
+    e.g. its player_ptr is invalid, so read_player() rejected it entirely --
+    salvages a degraded entry from the slot's own native fields instead of
+    silently dropping the local player's real result. Falls back to lowest
+    address only if CLIENT itself can't resolve a slot index at all (this
+    fallback is genuinely "wrong in general" -- it can mislabel a real
+    networked player as local -- so it must never be reached just because
+    the local slot's player_ptr happened to be bad; that's the salvage
+    path's job instead)."""
     local_player = None
     if module_base is not None and table_base is not None and slot0 is not None:
         local_slot = _local_player_slot_index(f, table_base)
@@ -404,7 +457,15 @@ def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int],
                 if (addr - slot0) // SLOT_STRIDE == local_slot:
                     local_player = p
                     break
+            if local_player is None:
+                addr = slot0 + local_slot * SLOT_STRIDE
+                d = validate_entry(f, addr)
+                if d is not None:
+                    local_player = _read_player_native_only(f, d)
+                    pairs.append((addr, local_player))
     if local_player is None:
+        if not pairs:
+            return
         _, local_player = min(pairs, key=lambda pair: pair[0])
     local_player.is_local = True
 
@@ -448,8 +509,12 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                     if p and p.name not in seen_names:
                         seen_names.add(p.name)
                         cached_pairs.append((addr, p))
+                # Always attempt local-player resolution, even if nothing
+                # else currently validates -- a solo/AI race where the local
+                # player's own slot has a bad player_ptr this tick would
+                # otherwise never get the salvage path a chance to run.
+                _mark_local_player(f, module_base, table_base, cached_pairs, min(cached_addrs))
                 if cached_pairs:
-                    _mark_local_player(f, module_base, table_base, cached_pairs, min(cached_addrs))
                     cached_players = [p for _, p in cached_pairs]
                     cached_players.sort(key=lambda x: x.total_time_ms)
                     for i, p in enumerate(cached_players):
@@ -483,18 +548,36 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 seen_names.add(p.name)
                 pairs.append((addr, p))
 
+            # Always attempt local-player resolution, even if nothing else
+            # currently validates -- see the identical comment in the cached
+            # branch above.
+            _mark_local_player(f, module_base, table_base, pairs, min(hits))
             if not pairs:
                 return None, None
-            _mark_local_player(f, module_base, table_base, pairs, min(hits))
     except _PROC_ERRORS:
         return None, None
 
     players_raw = [p for _, p in pairs]
-    good_addrs = [addr for addr, _ in pairs]
     players_raw.sort(key=lambda x: x.total_time_ms)
     for i, p in enumerate(players_raw):
         p.position = i + 1
-    return players_raw, good_addrs
+    # Cache the FULL candidate slot list (`hits`), not just whichever ones
+    # happened to validate on this exact scan (`[addr for addr, _ in pairs]`,
+    # the previous behavior). Both discovery paths (pointer chain, sentinel
+    # scan) find slots by structural existence, independent of whether that
+    # player's stats are populated *yet* -- a slot that isn't valid this tick
+    # (e.g. hasn't posted a first lap time -- entirely normal if discovery
+    # runs while a race is still in progress, which is the tool's whole
+    # intended use) is still a real slot. The cached-path branch above
+    # already tolerates some cached addresses being momentarily invalid (it
+    # just skips them that tick, cached_addrs is returned unchanged either
+    # way) -- caching only the validated subset meant any player not yet
+    # valid at discovery time was silently, permanently dropped for the rest
+    # of the game session, since the cached path never re-scans. Confirmed
+    # live 2026-08-05: a discovery scan mid-race caught only 1 of 6 racers
+    # as currently valid, and the other 5 were never looked at again even
+    # once they became fully valid later in the same race.
+    return players_raw, hits
 
 
 # ── engine string hash (MurmurHash2 variant) + name registry ─────────────────
@@ -891,21 +974,36 @@ def _read_differential(f, pid: int, anchor_addr: Optional[int]) -> Optional[int]
     return ri32(f, base + idx * _TUNE_ARR_STRIDE + _TUNE_ARR_VAL_OFF)
 
 
-def read_tuning(pid: int) -> dict:
-    """Current 0-4 index per tuning category; a not-yet-visited category is omitted, not guessed."""
+def _read_tuning_widgets(pid: int) -> dict:
+    """Current 0-4 index per tuning category, read off the Tune-screen slider
+    widgets; a not-yet-visited category is omitted, not guessed. Superseded
+    by _read_loadout_tuning() below (see that function's docstring) as the
+    primary source as of 2026-08-06 -- kept only as a fallback for the brief
+    window before the loadout array exists for a freshly-loaded car, and to
+    keep --watch-tuning's original behavior available for comparison."""
     result = {}
     try:
         with _mem_and_bases(pid) as (f, _, table_base):
             if not table_base:
                 return result
-            anchor_addr = _tune_slider_track_ptr(f, table_base, "SUSPENSION")
+            # DIFFERENTIAL has no registry entry of its own (see _find_tune_array's
+            # docstring) -- its value is located by scanning the heap region
+            # around an already-resolved slider widget instead. Any of the other
+            # three works equally well as that anchor (same arena), so try them
+            # in order rather than hardcoding SUSPENSION specifically -- a
+            # session where SUSPENSION's own tab was never visited would
+            # otherwise permanently block DIFFERENTIAL too, even if GEARING or
+            # BRAKES (and DIFFERENTIAL itself) were.
+            track_ptrs = {c: _tune_slider_track_ptr(f, table_base, c)
+                          for c in TUNE_CATEGORIES if c != "DIFFERENTIAL"}
+            anchor_addr = next((p for p in track_ptrs.values() if p), None)
             for category in TUNE_CATEGORIES:
                 if category == "DIFFERENTIAL":
                     raw_idx = _read_differential(f, pid, anchor_addr)
                     if raw_idx is not None:
                         result[category] = raw_idx
                     continue
-                track_ptr = anchor_addr if category == "SUSPENSION" else _tune_slider_track_ptr(f, table_base, category)
+                track_ptr = track_ptrs[category]
                 if not track_ptr:
                     continue
                 raw = ri32(f, track_ptr + TUNE_TRACK_VALUE_OFF)
@@ -915,6 +1013,23 @@ def read_tuning(pid: int) -> dict:
                 result[category] = round(frac * TUNE_MAX_INDEX)
     except _MEM_ERRORS:
         return result
+    return result
+
+
+def read_tuning(pid: int) -> dict:
+    """Current 0-4 index per tuning category, live (no save required this
+    session, no Tune-screen tab visits required either). Tries the
+    equipped-part loadout array first (_read_loadout_tuning, defined in the
+    cars5 section below since it reuses that section's path-parsing regex
+    and preset tables) -- confirmed 2026-08-06 far more reliable than the
+    slider-widget read (in particular for GEARING, which the widget read
+    could never track -- see _read_tuning_widgets). Falls back to the
+    widget read for any category the array doesn't have a record for yet."""
+    result = _read_loadout_tuning(pid)
+    if len(result) == len(TUNE_CATEGORIES):
+        return result
+    for k, v in _read_tuning_widgets(pid).items():
+        result.setdefault(k, v)
     return result
 
 
@@ -932,6 +1047,418 @@ def watch_tuning(pid: int, interval: float = 0.5):
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\nStopped.")
+
+
+# ── car tuning, persisted (cars5.ccrs save file) ─────────────────────────────
+# Reads a car's *persisted* tuning straight off disk -- no live game process,
+# no memory reads, no Tune-screen visit required this session at all. This
+# replaces read_tuning()'s role for the main polling pipeline (below);
+# read_tuning()/watch_tuning() above are kept only for --watch-tuning, which
+# is a genuinely different, still-useful thing (live slider-drag feedback
+# on the Tune screen -- cars5.ccrs only updates when you back out).
+#
+# Found via a from-scratch reverse-engineering session (2026-08-05, see
+# wf-memory-tool/PROJECT.md parts 7-12): the file is a small header plus a
+# few LZ4-compressed chunks chained as one rolling stream (LZ4_compress_HC_
+# continue -- the 2nd+ chunk's back-references reach into the *previous*
+# chunk's own decompressed output, not just their own), which decompress to
+# a plain, human-readable catalog: one block per owned car (keyed by an
+# internal vehicle codename, e.g. "supervan"), each listing that car's
+# current gearbox/suspension/brakes/transmission part as a literal path
+# string (e.g. "data/vehicle/supervan/part/gearbox/short.vege"). Cross-
+# validated live: all 4 categories x all 5 slider positions (20 points),
+# every one an exact match.
+CARS5_PATH_GLOB = os.path.expanduser(
+    "~/.local/share/Steam/userdata/*/228380/local/wreckfest/cars5.ccrs"
+)
+
+# slot's part-path key -> (TUNE_CATEGORIES label, [preset name for index 0..4])
+CARS5_TUNE_PRESETS = {
+    "gearbox":      ("GEARING",      ["eshort", "short", "std", "wide", "ewide"]),
+    "transmission": ("DIFFERENTIAL", ["open", "soft", "limited", "stiff", "locked"]),
+    "suspension":   ("SUSPENSION",   ["soft", "msoft", "standard", "mhard", "hard"]),
+    "brakes":       ("BRAKES",       ["rear", "mrear", "stock", "mfront", "front"]),
+}
+
+_CARS5_PART_PATH_RE = re.compile(
+    rb"data/vehicle/([a-zA-Z0-9_]+)/part/(gearbox|transmission|suspension|brakes)/([a-zA-Z]+)\.ve"
+)
+# Each car's record starts with a "VEHICLE_NAME_<id>_<n>" template-key string,
+# immediately followed by two length-prefixed fields (int32 len + bytes,
+# twice): the human display name, then "<codename>:default...".
+_CARS5_VEHICLE_NAME_RE = re.compile(rb"VEHICLE_NAME_\d+_\d+")
+
+
+def _lz4_decompress_block(data: bytes, max_output: int = 1 << 22, history: bytes = b"") -> bytes:
+    """Minimal pure-Python LZ4 *raw block* decompressor (no frame header, no
+    dependency -- `pip install lz4` isn't available in every deployment
+    environment, and this format doesn't need the real library's extra
+    features). `history` is prior decompressed output this block's back-
+    references may also reach into (see module docstring)."""
+    out = bytearray(history)
+    hist_len = len(history)
+    i = 0
+    n = len(data)
+    while i < n:
+        token = data[i]
+        i += 1
+        lit_len = token >> 4
+        if lit_len == 15:
+            while True:
+                b = data[i]
+                i += 1
+                lit_len += b
+                if b != 255:
+                    break
+        out += data[i:i + lit_len]
+        i += lit_len
+        if i >= n:
+            break  # final sequence has no match part
+        offset = data[i] | (data[i + 1] << 8)
+        i += 2
+        match_len = (token & 0x0F) + 4
+        if (token & 0x0F) == 15:
+            while True:
+                b = data[i]
+                i += 1
+                match_len += b
+                if b != 255:
+                    break
+        start = len(out) - offset
+        if start < 0:
+            raise ValueError(f"bad LZ4 offset {offset} at output len {len(out)}")
+        for k in range(match_len):
+            out.append(out[start + k])
+        if len(out) - hist_len > max_output:
+            raise ValueError("LZ4 output too large, probably desynced")
+    return bytes(out[hist_len:])
+
+
+def _find_cars5_path() -> Optional[str]:
+    matches = glob.glob(CARS5_PATH_GLOB)
+    if not matches:
+        return None
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return matches[0]
+
+
+def _decompress_cars5_chunks(buf: bytes) -> list:
+    """Parses the 20-byte header + chained-LZ4 chunk structure, fully and
+    exactly -- every chunk after the first is itself preceded by an 8-byte
+    mini-header whose first 4 bytes are that chunk's exact compressed
+    length (second 4 bytes: a per-chunk checksum, not needed to decompress).
+    Found live 2026-08-05 by comparing an exact GDB WriteFile capture's known
+    chunk boundaries against the mini-header bytes sitting between them in
+    the file -- previously approximated with a "try a few small skip
+    offsets" heuristic that turned out to only reliably reach 2 of the
+    file's 3 real chunks (see PROJECT.md part 8's original discovery and
+    part 17's correction) -- confirmed live that a whole 3rd chunk was being
+    missed/mis-decoded that way, silently hiding real owned cars (a
+    "<model> RS" race-spec variant sitting in chunk 3 as its own distinct
+    car, separate from the base "<model>" in chunks 1-2, for example)."""
+    if len(buf) < 20 or buf[4:8] != b"srcc":
+        raise ValueError("doesn't look like a cars5.ccrs file (bad header)")
+    field_a = struct.unpack_from("<I", buf, 12)[0]
+    off = 20
+    chunk = _lz4_decompress_block(buf[off:off + field_a])
+    chunks = [chunk]
+    off += field_a
+    history = chunk
+
+    while off + 8 <= len(buf):
+        chunk_len = struct.unpack_from("<I", buf, off)[0]
+        off += 8  # 4-byte length + 4-byte checksum
+        if chunk_len <= 0 or off + chunk_len > len(buf):
+            break
+        chunk = _lz4_decompress_block(buf[off:off + chunk_len], history=history)
+        chunks.append(chunk)
+        off += chunk_len
+        history += chunk
+
+    return chunks
+
+
+def _extract_cars5_tuning(chunks: list) -> dict:
+    """codename -> {part-path key: preset name}"""
+    cars: dict = {}
+    for chunk in chunks:
+        for m in _CARS5_PART_PATH_RE.finditer(chunk):
+            codename, key, preset = m.group(1).decode(), m.group(2).decode(), m.group(3).decode()
+            cars.setdefault(codename, {})[key] = preset
+    return cars
+
+
+def _extract_cars5_display_names(chunks: list) -> dict:
+    """codename -> human display name (e.g. "supervan" -> "Supervan")."""
+    names: dict = {}
+    for chunk in chunks:
+        for m in _CARS5_VEHICLE_NAME_RE.finditer(chunk):
+            pos = m.end()
+            try:
+                name_len = struct.unpack_from("<I", chunk, pos)[0]
+                if not (0 < name_len < 64):
+                    continue
+                pos += 4
+                display_name = chunk[pos:pos + name_len].decode("utf-8", errors="replace")
+                pos += name_len
+                code_len = struct.unpack_from("<I", chunk, pos)[0]
+                if not (0 < code_len < 64):
+                    continue
+                pos += 4
+                codename = chunk[pos:pos + code_len].decode("utf-8", errors="replace").split(":")[0]
+                names[codename] = display_name
+            except (struct.error, IndexError):
+                continue
+    return names
+
+
+def _match_cars5_codename(car_name: str, display_names: dict) -> Optional[str]:
+    """Matches a live-memory car name against cars5.ccrs's catalog display
+    names. Exact match only, deliberately -- a same-day earlier version of
+    this function added a prefix-match fallback (in either direction) after
+    "Hammerhead RS" appeared to only match the catalog's "Hammerhead" entry
+    approximately. That was the wrong fix: it was actually compensating for
+    _decompress_cars5_chunks() silently missing/mis-decoding the file's 3rd
+    real chunk (now fixed -- see that function's docstring), which is where
+    the *real*, separate "Hammerhead RS" entry (`16_race_car`, a distinct
+    owned car from `16_european`'s "Hammerhead", with genuinely different
+    tuning) actually lives. A prefix match is actively dangerous here, not
+    just imprecise -- confirmed live it would have silently returned a
+    *different real car's* tuning data (verified: "Hammerhead" and
+    "Hammerhead RS" have different GEARING/SUSPENSION values). Once chunk
+    parsing is complete and correct, every live-memory car name has always
+    matched its catalog entry exactly in testing -- a missing exact match
+    should fail quiet (see read_tuning_from_save's contract), not guess."""
+    return next((c for c, n in display_names.items() if n == car_name), None)
+
+
+# ── car tuning, live (equipped-part loadout array) ───────────────────────────
+# The real answer to "what's live-tracking the not-yet-saved tuning value":
+# not the slider widgets (unreliable, see _read_tuning_widgets), and not any
+# cached last-saved string either -- a small (~4MB) rw heap region holds a
+# fixed-stride (0x120-byte) array of "currently equipped part" records, one
+# per part slot (gearbox/transmission/suspension/brakes/tires/...), each
+# holding the literal live resource-path string for that slot. Confirmed
+# live 2026-08-06: watched one record's tail flip soft -> msoft -> hard in
+# real time as SUSPENSION was dragged on-screen, with no save or backing out
+# in between -- this is the genuine live value, not a save-time snapshot.
+#
+# This array is easy to confuse with a much bigger (~50MB+) bump-allocator
+# arena elsewhere in the process that holds a *history* of past save-buffer
+# strings (thousands of stale duplicate paths, one batch per actual disk
+# write -- see machine_code_career/PROJECT.md part 18). Both contain the
+# same kind of path string, so content alone doesn't distinguish them;
+# what does is structure: this array's records sit exactly _LOADOUT_STRIDE
+# apart with a sequential per-record id, and the whole array lives in a
+# region far smaller than the historical arena -- filtering candidate
+# regions by size (skip anything past _LOADOUT_MAX_REGION_BYTES) turned out
+# to be a clean, address-independent way to skip the arena outright rather
+# than relying on today's specific addresses.
+#
+# Record layout (relative to record base, little-endian):
+#   +0x00..0x1E  unknown (pointer/tag-shaped fields, not needed)
+#   +0x1F        sequential slot id (uint8) -- adjacent records in the
+#                array differ by exactly 1; used only to validate a
+#                candidate base is really part of this array, not the
+#                differently-strided historical arena
+#   +0x23        NUL-terminated ASCII path, e.g.
+#                "data/vehicle/<codename>/part/<category>/<preset>.<ext>"
+#                -- decoded with the same _CARS5_PART_PATH_RE/
+#                CARS5_TUNE_PRESETS used for the save file, above.
+_LOADOUT_STRIDE            = 0x120
+_LOADOUT_ID_OFF             = 0x1F
+_LOADOUT_STR_OFF            = 0x23
+_LOADOUT_MAX_REGION_BYTES   = 20 * 1024 * 1024  # observed target region ~4MB; historical arena ~50MB+
+
+_loadout_array_cache: dict = {}  # pid -> one confirmed record base (any slot)
+
+
+def _loadout_id(f, addr: int) -> Optional[int]:
+    d = _rd(f, addr + _LOADOUT_ID_OFF, 1)
+    return d[0] if d else None
+
+
+def _loadout_path(f, addr: int) -> Optional[bytes]:
+    d = _rd(f, addr + _LOADOUT_STR_OFF, 128)
+    if not d:
+        return None
+    end = d.find(b'\x00')
+    return d[:end] if end != -1 else d
+
+
+def _loadout_record_ok(f, addr: int) -> bool:
+    """Cheap check used while walking an already-trusted array -- just
+    "does this look like one of our records", no neighbor cross-check."""
+    path = _loadout_path(f, addr)
+    return bool(path) and path.startswith(b"data/vehicle/") and b"/part/" in path
+
+
+def _loadout_base_has_categories(f, addr: int, min_categories: int = 2) -> bool:
+    """Walks a bounded window around `addr` and checks it actually contains
+    at least `min_categories` distinct real tuning categories (gearbox/
+    transmission/suspension/brakes) before trusting it as *the* live
+    per-car array. Needed because the stride+sequential-id shape alone
+    isn't unique -- confirmed live 2026-08-06 that another, differently-
+    populated region can pass the plain structural check (same stride,
+    same id-adjacency pattern) without actually holding any of our 4
+    categories, silently producing an empty read (see PROJECT.md)."""
+    seen = set()
+    for base in _walk_loadout_array(f, addr, max_span=20):
+        path = _loadout_path(f, base)
+        if not path:
+            continue
+        m = _CARS5_PART_PATH_RE.search(path)
+        if m:
+            seen.add(m.group(2))
+        if len(seen) >= min_categories:
+            return True
+    return False
+
+
+def _validate_loadout_base(f, addr: int) -> bool:
+    """Stricter check used only when trusting a brand-new candidate base
+    found by raw content search -- requires both a real neighbor exactly
+    _LOADOUT_STRIDE away whose id differs by 1 (rules out the historical
+    arena's differently-shaped/strided entries), AND actual tuning-category
+    content nearby (rules out other same-shaped-but-wrong arrays)."""
+    if not _loadout_record_ok(f, addr):
+        return False
+    sid = _loadout_id(f, addr)
+    if sid is None:
+        return False
+    nxt = _loadout_id(f, addr + _LOADOUT_STRIDE)
+    prv = _loadout_id(f, addr - _LOADOUT_STRIDE)
+    if not ((nxt is not None and nxt == (sid + 1) % 256) or
+            (prv is not None and prv == (sid - 1) % 256)):
+        return False
+    return _loadout_base_has_categories(f, addr)
+
+
+def _find_loadout_array(f, pid: int) -> Optional[int]:
+    """Locates one confirmed record base of the live loadout array, cached
+    per-pid thereafter. Scans writable regions smaller than
+    _LOADOUT_MAX_REGION_BYTES (skipping the huge historical arena outright)
+    for the b"data/vehicle/" anchor, validating each hit structurally
+    before trusting it."""
+    cached = _loadout_array_cache.get(pid)
+    if cached is not None and _loadout_base_has_categories(f, cached):
+        return cached
+    needle = b"data/vehicle/"
+    CHUNK = 4 * 1024 * 1024
+    for start, end in _writable_regions(pid):
+        if end - start > _LOADOUT_MAX_REGION_BYTES:
+            continue
+        offset = start
+        remaining = end - start
+        overlap = b""
+        while remaining > 0:
+            n = min(CHUNK, remaining)
+            f.seek(offset)
+            buf = f.read(n)
+            if not buf:
+                break
+            hay = overlap + buf
+            hay_base = offset - len(overlap)
+            pos = 0
+            while True:
+                idx = hay.find(needle, pos)
+                if idx == -1:
+                    break
+                hit_addr = hay_base + idx
+                pos = idx + 1
+                base = hit_addr - _LOADOUT_STR_OFF
+                if _validate_loadout_base(f, base):
+                    _loadout_array_cache[pid] = base
+                    return base
+            overlap = buf[-(len(needle) - 1):]
+            offset += len(buf)
+            remaining -= len(buf)
+    return None
+
+
+def _walk_loadout_array(f, anchor: int, max_span: int = 40) -> list:
+    """All record bases reachable from `anchor` by walking +-_LOADOUT_STRIDE,
+    for up to max_span steps each direction. Deliberately does NOT stop at
+    the first record whose path doesn't parse as a part path (e.g. an
+    engine sub-part slot with no current selection has a differently-
+    shaped record at the same stride) -- confirmed live 2026-08-06 that
+    such records sit *in the middle* of an otherwise-valid run, and
+    stopping there silently truncated the walk before it ever reached
+    GEARING/DIFFERENTIAL/SUSPENSION/BRAKES. Only stops early if the
+    memory itself becomes unreadable (walked off the end of the array)."""
+    bases = [anchor]
+    base = anchor
+    for _ in range(max_span):
+        nxt = base + _LOADOUT_STRIDE
+        if _loadout_id(f, nxt) is None:
+            break
+        bases.append(nxt)
+        base = nxt
+    base = anchor
+    for _ in range(max_span):
+        prv = base - _LOADOUT_STRIDE
+        if _loadout_id(f, prv) is None:
+            break
+        bases.append(prv)
+        base = prv
+    return bases
+
+
+def _read_loadout_tuning(pid: int) -> dict:
+    """Current 0-4 index per tuning category, read from the live equipped-
+    part loadout array (see section docstring above). Fail-quiet, same
+    contract as read_tuning_from_save(): {} on any failure."""
+    result: dict = {}
+    try:
+        with _mem_and_bases(pid) as (f, _, _):
+            anchor = _find_loadout_array(f, pid)
+            if anchor is None:
+                return result
+            for base in _walk_loadout_array(f, anchor):
+                path = _loadout_path(f, base)
+                if not path:
+                    continue
+                m = _CARS5_PART_PATH_RE.search(path)
+                if not m:
+                    continue
+                key, preset = m.group(2).decode(), m.group(3).decode()
+                label, presets = CARS5_TUNE_PRESETS[key]
+                if preset in presets:
+                    result[label] = presets.index(preset)
+    except _MEM_ERRORS:
+        return result
+    return result
+
+
+def read_tuning_from_save(car_name: str) -> dict:
+    """Current 0-4 index per tuning category for the owned car whose display
+    name matches `car_name` exactly (see _match_cars5_codename), read
+    straight from cars5.ccrs on disk -- persisted, so this works whether or
+    not the Tune screen was ever visited this session. Returns {} if the
+    file can't be found/parsed or no car matches (same fail-quiet contract
+    as read_tuning())."""
+    result: dict = {}
+    if not car_name:
+        return result
+    try:
+        path = _find_cars5_path()
+        if not path:
+            return result
+        buf = open(path, "rb").read()
+        chunks = _decompress_cars5_chunks(buf)
+        cars = _extract_cars5_tuning(chunks)
+        display_names = _extract_cars5_display_names(chunks)
+        codename = _match_cars5_codename(car_name, display_names)
+        if codename is None or codename not in cars:
+            return result
+        parts = cars[codename]
+        for key, (label, presets) in CARS5_TUNE_PRESETS.items():
+            preset = parts.get(key)
+            if preset in presets:
+                result[label] = presets.index(preset)
+    except (OSError, ValueError):
+        return result
+    return result
 
 
 # ── output ────────────────────────────────────────────────────────────────────
@@ -1156,10 +1683,28 @@ def main():
     print(f"Polling every {args.interval}s — press Ctrl+C to stop")
     print("(Initial scan may take ~10s while memory is indexed)\n")
 
-    last_fingerprint = None   # last CONFIRMED (already-logged) race
-    cached_addrs     = None
-    scan_needed      = True
-    cached_tuning    = {}
+    # A race is only treated as truly over once BOTH signals agree:
+    #   1. every player's own FINISHED_BIT is set (_race_is_final()) -- gates
+    #      against a merely-paused game, since a pause never sets that bit
+    #      (see the 2026-08-02 entries in PROJECT.md).
+    #   2. total_time_ms has stopped changing across consecutive polls (the
+    #      user's own suggestion) -- confirmed live 2026-08-06 that a real
+    #      finish leaves total_time_ms dead-frozen (polled repeatedly with
+    #      zero drift), matching the pre-FINISHED_BIT debounce this project
+    #      used successfully before.
+    # An edge-triggered check on FINISHED_BIT alone (the previous attempt at
+    # this fix) wasn't enough for solo hot-lapping: confirmed live the same
+    # session that a solo player's FINISHED_BIT can flip False->True->
+    # False->True *twice* within one race -- a spurious blip partway
+    # through (e.g. at lap 2 of 4, where total_time_ms keeps climbing right
+    # through it, so it's clearly not really over yet) and then the real
+    # one at the actual finish, where total_time_ms stops for good.
+    # Requiring the clock to have actually stopped filters the mid-race
+    # blip out cleanly without needing to know why the bit flickers there.
+    last_fingerprint_seen   = None   # fingerprint from the previous poll, in any state
+    last_logged_fingerprint = None   # fingerprint of the race already logged -- skip re-logging it
+    cached_addrs = None
+    scan_needed  = True
 
     while True:
         try:
@@ -1171,19 +1716,11 @@ def main():
                 if cached_addrs is None:
                     scan_needed = True
 
-            if not players:
-                # Tuning only exists on the pre-race setup screen -- captured
-                # opportunistically here, before results ever appear. Once
-                # `players` is non-empty (results showing), the tuning
-                # widgets are gone/reset, so reading here would silently
-                # clobber the already-captured values with stale zeros.
-                current_tuning = read_tuning(pid)
-                if current_tuning:
-                    cached_tuning.update(current_tuning)
-
             if players:
                 fingerprint = tuple((p.name, p.total_time_ms) for p in players)
-                if fingerprint != last_fingerprint and _race_is_final(players):
+                is_stable = fingerprint == last_fingerprint_seen
+                if (_race_is_final(players) and is_stable
+                        and fingerprint != last_logged_fingerprint):
                     if args.debug and cached_addrs:
                         print(f"[debug] cluster base = 0x{min(cached_addrs):016x}  ({len(cached_addrs)} slots)")
                         for a in cached_addrs:
@@ -1191,15 +1728,23 @@ def main():
                     resolve_local_car_name(pid, players)
                     track, variation = detect_track_and_variation(pid)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                    # Persisted tuning, read straight from cars5.ccrs -- works
+                    # whether or not the Tune screen was ever visited this
+                    # session (the entire point; see read_tuning_from_save's
+                    # docstring). Needs the local player's car name, which
+                    # resolve_local_car_name() just filled in above.
+                    local_player = next((p for p in players if p.is_local), None)
+                    tuning = read_tuning_from_save(local_player.car) if local_player else {}
                     race = RaceResult(track=track, variation=variation, timestamp=ts,
-                                      players=players, tuning=dict(cached_tuning))
+                                      players=players, tuning=tuning)
                     _emit_race(race, args, api_config)
-                    last_fingerprint = fingerprint
+                    last_logged_fingerprint = fingerprint
+                last_fingerprint_seen = fingerprint
             else:
-                if last_fingerprint is not None:
+                if last_logged_fingerprint is not None:
                     print(f"[{_ts()}] Results cleared — waiting for next race...")
-                    last_fingerprint = None
-                    cached_tuning = {}   # next race starts a fresh setup capture
+                last_fingerprint_seen = None
+                last_logged_fingerprint = None
 
             time.sleep(args.interval)
 
