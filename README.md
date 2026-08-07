@@ -44,7 +44,9 @@ Copy `config.json.example` to `config.json` and fill in your `api_key`, `supabas
 
 Wreckfest runs under Proton, which is real Windows game code — so its in-memory data layout is identical to running natively on Windows. This tool opens `/proc/<pid>/mem` (the same interface a debugger uses) and reads that layout directly: a fixed-size table the game keeps for the current race's standings, plus the engine's own internal name-lookup table to resolve things like the track and car names to their real display text. A race is only reported once every driver's own "finished" flag is set in that table — not when times merely look plausible — so it won't fire early on a fast finish, a tie, or a paused game.
 
-All of this depends on Wreckfest's current memory layout. A game update that changes these internal structures could break it; if results stop showing up correctly, that's the first thing to suspect.
+**Tuning** (suspension/gear ratio/differential/brake balance) is read separately, straight out of the game's own save file (`cars5.ccrs`) rather than live memory — this is your *persisted* tuning for whichever car you raced, so it's always included, whether or not you visited the pre-race Tune screen this session. (`--watch-tuning` is different: it reads the Tune screen's live memory instead, for watching a slider change value in real time as you drag it — the save file only updates once you back out.)
+
+All of this depends on Wreckfest's current memory/save-file layout. A game update that changes these internal structures could break it; if results or tuning stop showing up correctly, that's the first thing to suspect.
 
 ## Troubleshooting
 
