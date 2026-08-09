@@ -1537,12 +1537,9 @@ def _race_results_table_str(race: RaceResult, width: int = 76) -> str:
         f"  {'-' * (width - 2)}",
     ]
     for p in race.players:
-        laps = ""
-        if p.lap_times_ms:
-            laps = "  [" + "  ".join(ms_to_str(t) for t in p.lap_times_ms) + "]"
         name = f"{p.name} (you)" if p.is_local else p.name
         lines.append(f"  {p.position:<4} {name:<20} {p.car:<18} {p.class_str():<7} "
-                      f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms)}{laps}")
+                      f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms)}")
     lines.append("=" * width)
     return "\n".join(lines)
 
