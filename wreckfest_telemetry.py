@@ -33,6 +33,22 @@ _MEM_ERRORS  = (FileNotFoundError, PermissionError, OSError)  # ditto, plus a li
 SLOT_STRIDE = 272   # bytes between entries in the 24-slot player array
 MAX_PLAYERS = 24
 
+# Found 2026-08-07 via a Cheat Engine pointer scan against slot[0] (a Linux-
+# native CE build + ceserver, see PROJECT.md) -- 26 candidate chains came
+# back, verified live by walking every one directly against a *freshly
+# restarted* game process (not CE's own rescan, which wasn't cooperating)
+# and checking which still landed on the new slot[0] address: 25 of 26
+# survived, including this one, the shortest. Each hop dereferences the
+# current address and adds the next offset; the address after the last hop
+# IS slot[0] -- no further deref. Supersedes CHAIN_STATIC_OFFSET/
+# CHAIN_ARRAY_OFFSET below, confirmed dead since 2026-07-27 (zero static
+# cross-references in Ghidra, reached via a runtime-computed array index --
+# manual hunting never found a replacement; CE's pointermap did).
+SLOT0_CHAIN_BASE_OFFSET = 0x2cb6c60      # module_base + this -> first hop
+SLOT0_CHAIN_HOPS        = (0x0, 0x18, 0x50, 0x74)   # dereference, +offset, repeat -> slot[0]
+
+# Dead fast path, kept only for the historical record (see PROJECT.md,
+# 2026-07-27/-31) -- fast_find_slots() no longer uses these.
 CHAIN_STATIC_OFFSET = 0x2cbcde0   # module_base + this -> race_manager_ptr
 CHAIN_ARRAY_OFFSET  = 0x1d84      # race_manager_ptr + this -> slot[0]
 
@@ -246,16 +262,23 @@ def find_module_base(pid: int) -> Optional[int]:
 
 
 def fast_find_slots(pid: int) -> Optional[list]:
-    """Follow the static pointer chain to the 24 player-result slots. None if chain broken."""
+    """Follow the static pointer chain (SLOT0_CHAIN_BASE_OFFSET/
+    SLOT0_CHAIN_HOPS) to the 24 player-result slots. None if the chain is
+    broken -- the sentinel check at the end is kept as a safety net even
+    though the chain is restart-verified (see its docstring above), in case
+    a future game update shifts it again the same way the old one did."""
     module_base = find_module_base(pid)
     if module_base is None:
         return None
     try:
         with open(f"/proc/{pid}/mem", "rb") as f:
-            manager_ptr = ru64(f, module_base + CHAIN_STATIC_OFFSET)
-            if not manager_ptr:
-                return None
-            slot0 = manager_ptr + CHAIN_ARRAY_OFFSET
+            addr = module_base + SLOT0_CHAIN_BASE_OFFSET
+            for hop in SLOT0_CHAIN_HOPS:
+                ptr = ru64(f, addr)
+                if not ptr:
+                    return None
+                addr = ptr + hop
+            slot0 = addr
             if _rd(f, slot0 + OFF_SENTINEL_A, 8) != SENTINEL:
                 return None
             return [slot0 + n * SLOT_STRIDE for n in range(MAX_PLAYERS)]
@@ -1430,6 +1453,179 @@ def _read_loadout_tuning(pid: int) -> dict:
     return result
 
 
+def dump_addrs(pid: int) -> None:
+    """One-shot dump of every notable address this tool resolves during a
+    normal run -- module base, the name registry, the player-result array,
+    the track/car/tuning objects reached through it, and the live loadout
+    array -- for feeding into an external tool (e.g. Cheat Engine via
+    ceserver) to pointer-scan against. Most of these already have a known
+    static chain (printed as module+offset -> ... -> address) and don't
+    need CE at all; the loadout array is the one exception with no known
+    stored pointer (see PROJECT.md, 2026-08-06: an exhaustive literal-
+    pointer scan + a GDB call-chain trace both came back inconclusive) --
+    that's the one actually worth pointer-scanning.
+
+    Each section is independent and prints "not found"/"n/a" rather than
+    aborting the whole dump on failure -- several of these only exist in
+    certain game states (mid-race, Tune screen visited this session,
+    career car loaded, etc.), same fail-quiet contract as the rest of this
+    file. Re-run after a game restart to get fresh addresses for CE's
+    "rescan pointers after restart" step."""
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as f:
+            module_base = find_module_base(pid)
+            print(f"Module base (Wreckfest_x64.exe):  {module_base:#x}" if module_base
+                  else "Module base: NOT FOUND")
+            if module_base is None:
+                return
+
+            table_base = _get_table_base(f, pid, module_base)
+            print(f"Registry table_base (module+{PTR_DAT_OFFSET:#x}):  "
+                  f"{table_base:#x}" if table_base else
+                  f"Registry table_base (module+{PTR_DAT_OFFSET:#x}): NOT FOUND")
+
+            # ── player-result array (fast chain, else sentinel-scan fallback) ──
+            print("\n-- Player-result array --")
+            fast_hits = fast_find_slots(pid)
+            hop_str = " -> ".join(f"+{h:#x}" for h in SLOT0_CHAIN_HOPS)
+            if fast_hits:
+                print(f"  via fast chain: module+{SLOT0_CHAIN_BASE_OFFSET:#x} -> {hop_str} -> slot[0]")
+                print(f"  slot[0] = {fast_hits[0]:#x}  ({len(fast_hits)} slots, stride {SLOT_STRIDE:#x})")
+            else:
+                print(f"  fast chain (module+{SLOT0_CHAIN_BASE_OFFSET:#x}) broken/stale -- sentinel-scanning...")
+                raw_hits = scan_for_sentinels(pid, anon_writable_regions(pid))
+                clustered = cluster_sentinel_hits(raw_hits) if raw_hits else []
+                if clustered:
+                    print(f"  found via sentinel scan: slot[0] = {min(clustered):#x}  "
+                          f"({len(clustered)} slots, stride {SLOT_STRIDE:#x})")
+                else:
+                    print("  nothing found (no race in memory right now -- menu/garage?)")
+
+            if table_base:
+                # ── CLIENT (local player slot id) ──
+                print("\n-- CLIENT singleton (local player slot id) --")
+                client_obj = _hash_registry_lookup(f, table_base, "CLIENT")
+                print(f"  CLIENT object: {client_obj:#x}" if client_obj else "  not found in registry")
+
+                # ── event_settings (track/variation) ──
+                print("\n-- event_settings (track/variation) --")
+                es_obj = _hash_registry_lookup(f, table_base, "event_settings")
+                if es_obj:
+                    print(f"  event_settings object: {es_obj:#x}")
+                    base_ptr = ru64(f, es_obj + EVENT_SETTINGS_BASE_TRACK_FIELD_OFF)
+                    base_codename = rcstr(f, base_ptr, 64) if base_ptr else ""
+                    print(f"    base codename ptr (+{EVENT_SETTINGS_BASE_TRACK_FIELD_OFF:#x}): "
+                          f"{base_ptr:#x}  ('{base_codename}')" if base_ptr else "    base codename ptr: n/a")
+                    if base_codename:
+                        env_obj = _resolve_environment_object(f, module_base, table_base, base_codename)
+                        print(f"    environment object: {env_obj:#x}" if env_obj
+                              else "    environment object: not found")
+                else:
+                    print("  not found in registry (not in a race?)")
+
+                # ── local player's car (career save chain) ──
+                print("\n-- Local player's car (career save chain) --")
+                career_obj = _hash_registry_lookup(f, table_base, CAREER_RESOURCE_NAME)
+                if career_obj:
+                    print(f"  career object ('{CAREER_RESOURCE_NAME}'): {career_obj:#x}")
+                    garage_idx = ri32(f, career_obj + 0x1c)
+                    vehicle_id = ri32(f, career_obj + 0x180)
+                    print(f"    garage_idx={garage_idx}  vehicle_id={vehicle_id}")
+                    garage_obj = (ru64(f, table_base + OBJ_ARR_OFF + garage_idx * REGISTRY_STRIDE)
+                                  if garage_idx is not None else None)
+                    print(f"    garage object: {garage_obj:#x}" if garage_obj else "    garage object: n/a")
+                    if garage_obj and vehicle_id is not None and vehicle_id >= 0:
+                        vehicles_base = ru64(f, garage_obj)
+                        if vehicles_base:
+                            car_def = vehicles_base + vehicle_id * 0x90
+                            view_obj = ru64(f, car_def)
+                            print(f"    vehicles_base: {vehicles_base:#x}  car_def: {car_def:#x}  "
+                                  f"view_obj: {view_obj:#x}" if view_obj else
+                                  f"    vehicles_base: {vehicles_base:#x}  car_def: {car_def:#x}  view_obj: n/a")
+                else:
+                    print(f"  not found ('{CAREER_RESOURCE_NAME}' not in registry)")
+
+                # ── tuning slider widgets (menu/element registry) ──
+                print("\n-- Tuning slider widgets (menu/element registry) --")
+                anchor_addr = None
+                for category in TUNE_CATEGORIES:
+                    if category == "DIFFERENTIAL":
+                        continue
+                    ptr = _tune_slider_track_ptr(f, table_base, category)
+                    print(f"  {category}_TRACK: {ptr:#x}" if ptr else
+                          f"  {category}_TRACK: not visited this session yet")
+                    if ptr and anchor_addr is None:
+                        anchor_addr = ptr
+
+                # ── DIFFERENTIAL tune-value array (structural scan, no registry entry) ──
+                print("\n-- DIFFERENTIAL tune-value array (structural scan) --")
+                tune_arr_base = _find_tune_array(f, pid, anchor_addr) if anchor_addr else None
+                if tune_arr_base:
+                    print(f"  array base: {tune_arr_base:#x}  ({_TUNE_ARR_LEN} structs, stride {_TUNE_ARR_STRIDE:#x})")
+                    for i, cat in enumerate(TUNE_CATEGORIES):
+                        print(f"    [{i}] {cat}: {tune_arr_base + i * _TUNE_ARR_STRIDE:#x}")
+                elif anchor_addr is None:
+                    print("  not found (needs at least one slider tab visited this session, as a scan anchor)")
+                else:
+                    print(f"  not found (had an anchor at {anchor_addr:#x} but the structural scan "
+                          "still came up empty this attempt)")
+            else:
+                print("\n(skipping CLIENT/event_settings/car/tuning-widget sections -- no table_base)")
+
+            # ── localization string hash table ──
+            print("\n-- Localization string hash table --")
+            bucket_table_ptr = ru64(f, module_base + LOC_HASH_TABLE_PTR_OFF)
+            print(f"  bucket_table_ptr (module+{LOC_HASH_TABLE_PTR_OFF:#x}): {bucket_table_ptr:#x}"
+                  if bucket_table_ptr else f"  bucket_table_ptr (module+{LOC_HASH_TABLE_PTR_OFF:#x}): n/a")
+
+            # ── live equipped-part loadout array -- THE interesting one ──
+            print("\n-- Live equipped-part loadout array (NO known static pointer -- see PROJECT.md) --")
+            anchor = _find_loadout_array(f, pid)
+            if anchor is None:
+                print("  not found (not on the Tune screen / car not loaded yet?)")
+                return
+            print(f"  anchor record: {anchor:#x}")
+            records = sorted(_walk_loadout_array(f, anchor))
+
+            # Split into the 4 records this project actually cares about
+            # (GEARING/DIFFERENTIAL/SUSPENSION/BRAKES, the ones read_tuning()
+            # extracts) vs. everything else in the same array (engine
+            # sub-parts, tires, etc. -- present but not useful pointer-scan
+            # targets, so just counted rather than listed one by one).
+            tuning_hits, other_addrs = [], []
+            for base in records:
+                path = _loadout_path(f, base)
+                m = _CARS5_PART_PATH_RE.search(path) if path else None
+                key = m.group(2).decode() if m else None
+                preset = m.group(3).decode() if m else None
+                info = CARS5_TUNE_PRESETS.get(key)
+                if info and preset in info[1]:
+                    tuning_hits.append((base, info[0], key, preset))
+                else:
+                    other_addrs.append(base)
+
+            print(f"  ({len(records)} total records in the array, stride {_LOADOUT_STRIDE:#x} bytes)")
+            print(f"  Tuning-category records ({len(tuning_hits)}/{len(TUNE_CATEGORIES)} currently resolvable):")
+            for base, label, key, preset in tuning_hits:
+                print(f"    {base:#x}  {label:<12} (part/{key}/{preset})")
+            missing = sorted(set(TUNE_CATEGORIES) - {label for _, label, _, _ in tuning_hits})
+            if missing:
+                print(f"    missing: {', '.join(missing)} -- not equipped/changed this session yet?")
+
+            print(f"  {len(other_addrs)} other equipped-part records in the same array "
+                  "(engine sub-parts, tires, etc.) -- first few:")
+            for base in other_addrs[:5]:
+                print(f"    {base:#x}")
+
+            print("\nPointer-scan tip: the loadout array is the one section above with no")
+            print(f"known static chain -- scan CE for a pointer to one of its addresses (record")
+            print(f"base, or +{_LOADOUT_STR_OFF:#x} for the string field itself), then restart the")
+            print("game, re-run this dump, and rescan against the new address to filter out")
+            print("anything that doesn't survive a restart.")
+    except _MEM_ERRORS as e:
+        print(f"ERROR: couldn't read process memory ({e})")
+
+
 def read_tuning_from_save(car_name: str) -> dict:
     """Current 0-4 index per tuning category for the owned car whose display
     name matches `car_name` exactly (see _match_cars5_codename), read
@@ -1657,6 +1853,9 @@ def main():
     ap.add_argument("--debug",    action="store_true", help="Print raw slot addresses for each detected race")
     ap.add_argument("--watch-tuning", action="store_true",
                     help="Watch the pre-race tuning screen live and print each slider value as it's set")
+    ap.add_argument("--dump-addrs", action="store_true",
+                    help="Print raw addresses (loadout array records, module base) for pointer-scanning "
+                         "with an external tool (e.g. Cheat Engine via ceserver), then exit")
     ap.add_argument("--log-file", default="race_log.jsonl",
                     help="JSON-lines file to append each completed race to. Default: race_log.jsonl")
     ap.add_argument("--config",   default=DEFAULT_CONFIG_PATH,
@@ -1676,6 +1875,10 @@ def main():
 
     if args.watch_tuning:
         watch_tuning(args.pid, args.interval)
+        return
+
+    if args.dump_addrs:
+        dump_addrs(args.pid)
         return
 
     pid = args.pid
