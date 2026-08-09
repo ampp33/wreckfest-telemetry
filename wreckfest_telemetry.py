@@ -208,6 +208,17 @@ def _looks_garbled(s: str) -> bool:
     return any(ch < ' ' or ch == '�' for ch in s)
 
 
+# Quake-style color-code markers some Wreckfest servers prefix onto player
+# names (e.g. "^2*^0sharpneli" -> "sharpneli") -- a caret+digit color code,
+# optionally preceded by a literal '*' when two codes sit back-to-back.
+# Cosmetic only, not part of the real name.
+_COLOR_CODE_RE = re.compile(r'\*\^[0-9]|\^[0-9]')
+
+
+def _strip_color_codes(name: str) -> str:
+    return _COLOR_CODE_RE.sub('', name).strip()
+
+
 _VEHICLE_NAME_RE = re.compile(rb'VEHICLE_NAME_[0-9]+_[0-9]+')
 
 
@@ -340,7 +351,7 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
     if not ptr or ptr < MIN_HEAP_PTR or ptr > (1 << 47):
         return None
 
-    name   = rcstr(f, ptr + POFF_NAME,   64)
+    name   = _strip_color_codes(rcstr(f, ptr + POFF_NAME, 64))
     car    = rcstr(f, ptr + POFF_CAR,    64)
     engine = rcstr(f, ptr + POFF_ENGINE, 32)
 
@@ -427,7 +438,7 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
     if ptr:
         candidate = rcstr(f, ptr + POFF_NAME, 64)
         if candidate and not _looks_garbled(candidate):
-            name = candidate
+            name = _strip_color_codes(candidate)
 
     return PlayerResult(
         position=0, name=name, car="", engine="",
@@ -487,6 +498,22 @@ def resolve_local_car_name(pid: int, players: list) -> None:
         return
 
 
+def _position_sort_key(p: PlayerResult) -> tuple:
+    """Ranks finished players by total_time_ms first, unfinished players
+    after (also by total_time_ms, as a stable tiebreak -- meaningless as an
+    actual ranking, but keeps output deterministic). Plain total_time_ms
+    alone isn't safe to sort the whole field by: confirmed live 2026-08-08
+    a still-racing/DNF'd straggler's total_time_ms can sit well BELOW the
+    genuinely-finished pack's (e.g. a FINISHED_BIT blip early in the race
+    froze their clock at an early, low value -- the same per-player
+    mid-race-blip failure mode _race_is_final()'s own docstring already
+    describes, just observed here in a real networked opponent instead of
+    the local player) -- sorting on total_time_ms alone let that straggler
+    outrank everyone who'd actually completed the race, including bumping
+    the actual winner down to 2nd in a real logged result."""
+    return (not p.finished, p.total_time_ms)
+
+
 def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
     """
     Returns (players, used_addrs), or (None, None/addrs) if nothing valid.
@@ -516,7 +543,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 _mark_local_player(f, module_base, table_base, cached_pairs, min(cached_addrs))
                 if cached_pairs:
                     cached_players = [p for _, p in cached_pairs]
-                    cached_players.sort(key=lambda x: x.total_time_ms)
+                    cached_players.sort(key=_position_sort_key)
                     for i, p in enumerate(cached_players):
                         p.position = i + 1
                     return cached_players, cached_addrs
@@ -558,7 +585,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
         return None, None
 
     players_raw = [p for _, p in pairs]
-    players_raw.sort(key=lambda x: x.total_time_ms)
+    players_raw.sort(key=_position_sort_key)
     for i, p in enumerate(players_raw):
         p.position = i + 1
     # Cache the FULL candidate slot list (`hits`), not just whichever ones
@@ -1461,7 +1488,65 @@ def read_tuning_from_save(car_name: str) -> dict:
     return result
 
 
+def read_tuning_for_race(pid: int, car_name: str) -> dict:
+    """Current 0-4 index per tuning category to attach to a just-finished
+    race. Prefers the LIVE equipped-part loadout array (_read_loadout_tuning
+    -- see that section's docstring; already the primary source for
+    --watch-tuning) over the persisted save file, falling back to
+    read_tuning_from_save() only for categories the live read doesn't have.
+
+    Confirmed live 2026-08-08: the previous behavior (read_tuning_from_save()
+    alone, unconditionally, per part 13 in PROJECT.md) can log stale tuning
+    when a race is raced and finishes *before* the player has backed out of
+    the Tune screen since their last change -- cars5.ccrs only gets rewritten
+    on backing out, not on every slider drag, so a race run against a
+    just-changed-but-not-yet-saved setting gets logged with the old value.
+    Caught directly in the user's own race_log.jsonl: a race at 14:42:30
+    logged SUSPENSION=2 (`standard`), but cars5.ccrs's own mtime showed it
+    wasn't written until 14:43:13 -- 43 seconds *after* that race was
+    already logged -- and the very next race (14:50:59, after the save)
+    correctly showed SUSPENSION=4 (`hard`), the value the player says was
+    actually in use both times.
+
+    The live loadout array doesn't have this lag (it reflects the equipped
+    part immediately, no save required -- see that section's docstring), so
+    it's used first here. Still falls back to the save file per-category
+    (rather than replacing it outright) because the save file is keyed by
+    the *race's own* car name, robust to the player having already moved on
+    to tuning a different car in the garage by the time this race's result
+    is processed -- a narrower edge case than the one this function fixes,
+    but still worth guarding since the live array has no such car-identity
+    check of its own."""
+    live = _read_loadout_tuning(pid)
+    if len(live) == len(TUNE_CATEGORIES):
+        return live
+    result = read_tuning_from_save(car_name)
+    result.update(live)   # live values win per-category where both exist
+    return result
+
+
 # ── output ────────────────────────────────────────────────────────────────────
+def _race_results_table_str(race: RaceResult, width: int = 76) -> str:
+    """Plain-text results table -- header/rule/rows/closing rule, matching
+    print_table()'s own table body exactly (factored out so it can also be
+    reused for the API payload's `notes` field -- see _race_to_api_payload).
+    Player names are already color-code-stripped at read time (see
+    _strip_color_codes()), so this comes out clean with no extra work here."""
+    lines = [
+        f"  {'POS':<4} {'NAME':<20} {'CAR':<18} {'CLASS':<7} {'BEST LAP':<11} TOTAL",
+        f"  {'-' * (width - 2)}",
+    ]
+    for p in race.players:
+        laps = ""
+        if p.lap_times_ms:
+            laps = "  [" + "  ".join(ms_to_str(t) for t in p.lap_times_ms) + "]"
+        name = f"{p.name} (you)" if p.is_local else p.name
+        lines.append(f"  {p.position:<4} {name:<20} {p.car:<18} {p.class_str():<7} "
+                      f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms)}{laps}")
+    lines.append("=" * width)
+    return "\n".join(lines)
+
+
 def print_table(race: RaceResult):
     loc = race.track
     if race.variation:
@@ -1475,16 +1560,7 @@ def print_table(race: RaceResult):
         tuning_str = "  ".join(f"{cat}={idx}" for cat, idx in race.tuning.items())
         print(f"  Tuning: {tuning_str}")
     print("=" * W)
-    print(f"  {'POS':<4} {'NAME':<20} {'CAR':<18} {'CLASS':<7} {'BEST LAP':<11} TOTAL")
-    print(f"  {'-' * (W - 2)}")
-    for p in race.players:
-        laps = ""
-        if p.lap_times_ms:
-            laps = "  [" + "  ".join(ms_to_str(t) for t in p.lap_times_ms) + "]"
-        name = f"{p.name} (you)" if p.is_local else p.name
-        print(f"  {p.position:<4} {name:<20} {p.car:<18} {p.class_str():<7} "
-              f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms)}{laps}")
-    print("=" * W)
+    print(_race_results_table_str(race, W))
     print()
 
 
@@ -1573,6 +1649,11 @@ def _race_to_api_payload(race: RaceResult) -> Optional[dict]:
         "gear_ratio":        tuning_1indexed("GEARING"),
         "differential":      tuning_1indexed("DIFFERENTIAL"),
         "brake_balance":     tuning_1indexed("BRAKES"),
+        # Full field/finishing-order table, per user request 2026-08-08 --
+        # same plain-text render used for console output (_race_results_table_str,
+        # shared with print_table()). Names are already color-code-stripped
+        # at read time, so this needs no extra cleanup here.
+        "notes":             _race_results_table_str(race),
     }
     for key, value in optional_fields.items():
         if value is not None:
@@ -1628,24 +1709,44 @@ def post_race_result(config: dict, race: RaceResult, timeout: float = 10.0) -> b
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def _race_is_final(players: list) -> bool:
-    """True once every player's own OFF_FINISHED_FLAG bit is set -- see the
-    comment there for how this was found and verified live. Replaces an
-    earlier total_time_ms-based heuristic (comparing values across players
-    and polls) that had no reliable way to tell "everyone genuinely finished"
-    apart from "the game is paused" -- both look identical when all you have
-    is a clock. This is a real per-player signal instead of an inference."""
+    """True once the LOCAL player's own OFF_FINISHED_FLAG bit is set -- see
+    the comment there for how the signal itself was found and verified live.
+    Deliberately checks only the local player, not every tracked racer (an
+    earlier version required all(p.finished for p in players)) -- confirmed
+    live 2026-08-08 in a real 24-player public lobby that requiring every
+    single racer's bit means one straggler/AFK/slow finisher among 23 other
+    people permanently blocks detection of the *local* player's own result:
+    the local player sat `finished=True` with a frozen `total_time_ms` for
+    9+ minutes while a handful of other racers were still out on track, and
+    the tool never once considered the race final -- results had already
+    cleared (player backed out) before the stragglers finished, so nothing
+    was ever logged. Offline/solo races never hit this (just the player +
+    AI, who finish within seconds of each other), which is why the bug was
+    online-only. Falls back to the old all-players check only if the local
+    player can't be identified at all (should be rare -- _mark_local_player()
+    already has its own salvage path for a bad player_ptr specifically)."""
+    local = next((p for p in players if p.is_local), None)
+    if local is not None:
+        return local.finished
     return all(p.finished for p in players)
 
 
-def _emit_race(race: RaceResult, args, api_config: dict) -> None:
-    """Print, optionally JSON-dump, always log, always try the API -- the one
-    sequence that happens for every newly-detected race."""
+def _emit_race(race: RaceResult, args, api_config: dict, allow_api: bool = True) -> None:
+    """Print, optionally JSON-dump, always log, try the API unless allow_api
+    is False -- the one sequence that happens for every newly-detected race.
+    allow_api exists for main()'s local-player identity consistency check
+    (see there): the file log always happens regardless, since that's safe
+    to review/correct by hand, but a low-confidence local-player match
+    should never get an unreviewable public API post attributed to the
+    wrong account."""
     print_table(race)
     if args.json:
         print(json.dumps(race_to_dict(race), indent=2))
     append_race_log(race, args.log_file)
     print(f"[{_ts()}] Logged to {args.log_file}")
-    if api_config and post_race_result(api_config, race):
+    if not allow_api:
+        print(f"[{_ts()}] API post skipped -- local player identity unconfirmed this race (see warning above)")
+    elif api_config and post_race_result(api_config, race):
         print(f"[{_ts()}] Posted to API")
 
 
@@ -1683,15 +1784,23 @@ def main():
     print(f"Polling every {args.interval}s — press Ctrl+C to stop")
     print("(Initial scan may take ~10s while memory is indexed)\n")
 
-    # A race is only treated as truly over once BOTH signals agree:
-    #   1. every player's own FINISHED_BIT is set (_race_is_final()) -- gates
-    #      against a merely-paused game, since a pause never sets that bit
-    #      (see the 2026-08-02 entries in PROJECT.md).
-    #   2. total_time_ms has stopped changing across consecutive polls (the
-    #      user's own suggestion) -- confirmed live 2026-08-06 that a real
-    #      finish leaves total_time_ms dead-frozen (polled repeatedly with
-    #      zero drift), matching the pre-FINISHED_BIT debounce this project
-    #      used successfully before.
+    # A race is only treated as truly over once BOTH signals agree, checked
+    # against the LOCAL player only (see _race_is_final()'s docstring for why
+    # -- in short, gating on every tracked racer instead of just the local
+    # one means a single straggler in a big online lobby can block detection
+    # of the local player's own, long-finished result forever):
+    #   1. the local player's own FINISHED_BIT is set (_race_is_final()) --
+    #      gates against a merely-paused game, since a pause never sets that
+    #      bit (see the 2026-08-02 entries in PROJECT.md).
+    #   2. the local player's own total_time_ms has stopped changing across
+    #      consecutive polls (the user's own suggestion) -- confirmed live
+    #      2026-08-06 that a real finish leaves total_time_ms dead-frozen
+    #      (polled repeatedly with zero drift), matching the pre-FINISHED_BIT
+    #      debounce this project used successfully before. Also confirmed
+    #      live 2026-08-08: the local player's own clock freezes at their
+    #      finish regardless of whether *other* racers are still mid-race --
+    #      so scoping the fingerprint to the local player alone doesn't just
+    #      avoid the other-racer trap, it's also the more accurate signal.
     # An edge-triggered check on FINISHED_BIT alone (the previous attempt at
     # this fix) wasn't enough for solo hot-lapping: confirmed live the same
     # session that a solo player's FINISHED_BIT can flip False->True->
@@ -1705,6 +1814,22 @@ def main():
     last_logged_fingerprint = None   # fingerprint of the race already logged -- skip re-logging it
     cached_addrs = None
     scan_needed  = True
+    # Session-established local-player identity, once resolved -- a safety
+    # net against _mark_local_player()'s CLIENT-based resolution confidently
+    # mislabeling a real *other* racer as local. Confirmed live 2026-08-08:
+    # this happened twice in one session (two different real opponents each
+    # logged, and API-posted, as the local player) while joining/spectating
+    # multiplayer races -- root cause not fully pinned down (CLIENT's slot
+    # index can plausibly go stale or get force-clamped in ways specific to
+    # "connected but not actually seated this heat"), so rather than guess
+    # at a targeted fix for a mechanism that couldn't be reproduced live to
+    # confirm, this is a mechanism-independent guard: once a name has been
+    # established as "you" this session, a later race resolving a DIFFERENT
+    # name as local is treated as untrusted -- still logged to the file for
+    # manual review, but the API post (the actually-harmful, public,
+    # hard-to-undo action) is skipped. Bootstraps from whichever name
+    # resolves first each session.
+    confirmed_local_name = None
 
     while True:
         try:
@@ -1717,7 +1842,20 @@ def main():
                     scan_needed = True
 
             if players:
-                fingerprint = tuple((p.name, p.total_time_ms) for p in players)
+                # Scoped to the LOCAL player only -- see _race_is_final()'s
+                # docstring and the block comment above for why: keying this
+                # off every tracked racer's total_time_ms meant a straggler
+                # still out on track kept the fingerprint "unstable" forever,
+                # blocking detection of the local player's own finish just
+                # as badly as the old all-players _race_is_final() did.
+                # Falls back to the whole-field fingerprint only if the local
+                # player can't be identified at all (matches _race_is_final()'s
+                # own fallback).
+                local_player = next((p for p in players if p.is_local), None)
+                if local_player is not None:
+                    fingerprint = (local_player.name, local_player.total_time_ms)
+                else:
+                    fingerprint = tuple((p.name, p.total_time_ms) for p in players)
                 is_stable = fingerprint == last_fingerprint_seen
                 if (_race_is_final(players) and is_stable
                         and fingerprint != last_logged_fingerprint):
@@ -1728,16 +1866,30 @@ def main():
                     resolve_local_car_name(pid, players)
                     track, variation = detect_track_and_variation(pid)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    # Persisted tuning, read straight from cars5.ccrs -- works
-                    # whether or not the Tune screen was ever visited this
-                    # session (the entire point; see read_tuning_from_save's
-                    # docstring). Needs the local player's car name, which
-                    # resolve_local_car_name() just filled in above.
-                    local_player = next((p for p in players if p.is_local), None)
-                    tuning = read_tuning_from_save(local_player.car) if local_player else {}
+                    # Tuning to attach to this race -- live loadout array
+                    # first, save-file fallback per category. See
+                    # read_tuning_for_race()'s docstring for why: the save
+                    # file alone can lag a real, already-raced tuning change
+                    # until the Tune screen is backed out of. Needs the local
+                    # player's car name, which resolve_local_car_name() just
+                    # filled in above.
+                    tuning = read_tuning_for_race(pid, local_player.car) if local_player else {}
                     race = RaceResult(track=track, variation=variation, timestamp=ts,
                                       players=players, tuning=tuning)
-                    _emit_race(race, args, api_config)
+                    # Identity consistency check -- see confirmed_local_name's
+                    # comment above for why this exists at all.
+                    identity_trusted = True
+                    if local_player is not None:
+                        if confirmed_local_name is None:
+                            confirmed_local_name = local_player.name
+                        elif local_player.name != confirmed_local_name:
+                            identity_trusted = False
+                            print(f"[{_ts()}] WARNING: local player identity mismatch -- "
+                                  f"expected {confirmed_local_name!r} (established earlier "
+                                  f"this session) but resolved {local_player.name!r} as local "
+                                  f"for this race. Logging to file, but skipping the API post "
+                                  f"to avoid attributing someone else's result to your account.")
+                    _emit_race(race, args, api_config, allow_api=identity_trusted)
                     last_logged_fingerprint = fingerprint
                 last_fingerprint_seen = fingerprint
             else:
