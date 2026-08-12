@@ -499,19 +499,33 @@ def resolve_local_car_name(pid: int, players: list) -> None:
 
 
 def _position_sort_key(p: PlayerResult) -> tuple:
-    """Ranks finished players by total_time_ms first, unfinished players
-    after (also by total_time_ms, as a stable tiebreak -- meaningless as an
-    actual ranking, but keeps output deterministic). Plain total_time_ms
-    alone isn't safe to sort the whole field by: confirmed live 2026-08-08
-    a still-racing/DNF'd straggler's total_time_ms can sit well BELOW the
+    """Ranks finished players by total_time_ms first (ascending -- fastest
+    wins), unfinished/DNF players after. Plain total_time_ms alone isn't
+    safe to sort the whole field by: confirmed live 2026-08-08 a still-
+    racing/DNF'd straggler's total_time_ms can sit well BELOW the
     genuinely-finished pack's (e.g. a FINISHED_BIT blip early in the race
     froze their clock at an early, low value -- the same per-player
     mid-race-blip failure mode _race_is_final()'s own docstring already
     describes, just observed here in a real networked opponent instead of
     the local player) -- sorting on total_time_ms alone let that straggler
     outrank everyone who'd actually completed the race, including bumping
-    the actual winner down to 2nd in a real logged result."""
-    return (not p.finished, p.total_time_ms)
+    the actual winner down to 2nd in a real logged result.
+
+    Within the DNF group specifically, sorted by total_time_ms DESCENDING
+    -- confirmed live 2026-08-08 against a real 2-DNF race (user directly
+    observed, on screen, that the two had died in the opposite order the
+    tool printed them in): total_time_ms is presumably a free-running
+    clock that just stops wherever a player's race ends (crash/quit/etc),
+    same as it freezes at the real finish time for a completed racer (see
+    the 2026-08-06 FINISHED_BIT entries) -- so a DNF with a HIGHER
+    total_time_ms got further before dropping out and should rank ahead
+    of one that dropped out earlier with a lower total_time_ms, the
+    opposite direction from the finished group's ascending sort. Ascending
+    (the previous behavior) ranked whoever died soonest as the better
+    finisher, backwards."""
+    if p.finished:
+        return (0, p.total_time_ms)
+    return (1, -p.total_time_ms)
 
 
 def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
@@ -1516,12 +1530,29 @@ def read_tuning_for_race(pid: int, car_name: str) -> dict:
     to tuning a different car in the garage by the time this race's result
     is processed -- a narrower edge case than the one this function fixes,
     but still worth guarding since the live array has no such car-identity
-    check of its own."""
+    check of its own.
+
+    Three sources, not two -- confirmed live 2026-08-09 this was missing a
+    step: for any category the loadout array doesn't have (e.g. right after
+    leaving the Tune screen, before the array's re-populated -- caught live
+    with SUSPENSION dropping out of _read_loadout_tuning() for several
+    seconds during that exact transition), this used to fall straight
+    through to the stale save file, skipping the *other* live source
+    (_read_tuning_widgets(), same slider-screen read --watch-tuning uses)
+    entirely -- even when the widget read had the correct, just-changed
+    value the whole time. Reproduced directly: SUSPENSION set to 2, loadout
+    array temporarily missing it, save file still showing the old 3 (not
+    yet written -- see the lag above), widget read correctly showing 2 --
+    old code returned 3, the stale value, purely because it never checked
+    the widget read at all. Now layers all three by freshness: loadout >
+    widgets > save file."""
     live = _read_loadout_tuning(pid)
     if len(live) == len(TUNE_CATEGORIES):
         return live
+    widgets = _read_tuning_widgets(pid)
     result = read_tuning_from_save(car_name)
-    result.update(live)   # live values win per-category where both exist
+    result.update(widgets)   # live widget values win over the stale save file
+    result.update(live)      # live loadout values win over everything else
     return result
 
 
