@@ -1003,11 +1003,14 @@ def _read_differential(f, pid: int, anchor_addr: Optional[int]) -> Optional[int]
 
 def _read_tuning_widgets(pid: int) -> dict:
     """Current 0-4 index per tuning category, read off the Tune-screen slider
-    widgets; a not-yet-visited category is omitted, not guessed. Superseded
-    by _read_loadout_tuning() below (see that function's docstring) as the
-    primary source as of 2026-08-06 -- kept only as a fallback for the brief
-    window before the loadout array exists for a freshly-loaded car, and to
-    keep --watch-tuning's original behavior available for comparison."""
+    widgets; a not-yet-visited category is omitted, not guessed. This is the
+    PRIMARY live tuning source again as of 2026-08-14 -- verified live in a
+    real online race against on-screen ground truth for all 4 categories
+    (including GEARING, which an earlier session had believed this couldn't
+    track) and confirmed to follow a real live change correctly. The
+    2026-08-06 "loadout array" source that briefly superseded this was found
+    the same day to be unreliable -- see the DEMOTED note in the loadout
+    array section below -- and is no longer used as a live source."""
     result = {}
     try:
         with _mem_and_bases(pid) as (f, _, table_base):
@@ -1044,20 +1047,16 @@ def _read_tuning_widgets(pid: int) -> dict:
 
 
 def read_tuning(pid: int) -> dict:
-    """Current 0-4 index per tuning category, live (no save required this
-    session, no Tune-screen tab visits required either). Tries the
-    equipped-part loadout array first (_read_loadout_tuning, defined in the
-    cars5 section below since it reuses that section's path-parsing regex
-    and preset tables) -- confirmed 2026-08-06 far more reliable than the
-    slider-widget read (in particular for GEARING, which the widget read
-    could never track -- see _read_tuning_widgets). Falls back to the
-    widget read for any category the array doesn't have a record for yet."""
-    result = _read_loadout_tuning(pid)
-    if len(result) == len(TUNE_CATEGORIES):
-        return result
-    for k, v in _read_tuning_widgets(pid).items():
-        result.setdefault(k, v)
-    return result
+    """Current 0-4 index per tuning category, live. Reads the Tune-screen
+    slider widgets (_read_tuning_widgets) -- the verified-correct live
+    source as of 2026-08-14 (see that function's docstring). A category
+    whose tab hasn't been visited this menu session is simply omitted, not
+    guessed -- there is no reliable live source for that case (the
+    equipped-part loadout array once used to cover this gap was found the
+    same day to sometimes return a *wrong* value, not just a missing one,
+    which is worse than omitting it -- see the DEMOTED note above
+    _read_loadout_tuning's section)."""
+    return _read_tuning_widgets(pid)
 
 
 def watch_tuning(pid: int, interval: float = 0.5):
@@ -1260,15 +1259,29 @@ def _match_cars5_codename(car_name: str, display_names: dict) -> Optional[str]:
 
 
 # ── car tuning, live (equipped-part loadout array) ───────────────────────────
-# The real answer to "what's live-tracking the not-yet-saved tuning value":
-# not the slider widgets (unreliable, see _read_tuning_widgets), and not any
-# cached last-saved string either -- a small (~4MB) rw heap region holds a
-# fixed-stride (0x120-byte) array of "currently equipped part" records, one
-# per part slot (gearbox/transmission/suspension/brakes/tires/...), each
-# holding the literal live resource-path string for that slot. Confirmed
+# DEMOTED 2026-08-14 -- do not use as a live tuning source. Confirmed live,
+# repeatedly, in a real online race: _find_loadout_array()'s "first
+# structurally-valid hit" scan lands on a *different car's* record between
+# calls with no code change (non-deterministic depending on scan timing/heap
+# state), and can silently return an outright WRONG value for a category
+# rather than an empty one -- caught directly: reported GEARING=3 while the
+# on-screen/ground-truth value (cross-checked against _read_tuning_widgets(),
+# itself verified live to track a real SUSPENSION change 4->3 correctly) was
+# GEARING=2. Root cause: the ~4MB region this scans isn't a per-player "my
+# currently equipped parts" array at all -- a full scan turned up 787
+# category-matching records spanning nearly every car in the game's entire
+# roster (01-16 across every class, including cars nobody in the race was
+# driving), i.e. a shared reference/preset pool, not live per-player state.
+# _read_tuning_widgets() (below) is the correct, verified live source now.
+#
+# Original (superseded) rationale, kept for context: a small (~4MB) rw heap
+# region holds a fixed-stride (0x120-byte) array of "currently equipped
+# part" records, one per part slot (gearbox/transmission/suspension/
+# brakes/tires/...), each holding a live resource-path string. Confirmed
 # live 2026-08-06: watched one record's tail flip soft -> msoft -> hard in
 # real time as SUSPENSION was dragged on-screen, with no save or backing out
-# in between -- this is the genuine live value, not a save-time snapshot.
+# in between -- a genuine live value, just not reliably *this session's
+# actual player's* record once the wrong-car problem above was found.
 #
 # This array is easy to confuse with a much bigger (~50MB+) bump-allocator
 # arena elsewhere in the process that holds a *history* of past save-buffer
@@ -1490,10 +1503,11 @@ def read_tuning_from_save(car_name: str) -> dict:
 
 def read_tuning_for_race(pid: int, car_name: str) -> dict:
     """Current 0-4 index per tuning category to attach to a just-finished
-    race. Prefers the LIVE equipped-part loadout array (_read_loadout_tuning
-    -- see that section's docstring; already the primary source for
-    --watch-tuning) over the persisted save file, falling back to
-    read_tuning_from_save() only for categories the live read doesn't have.
+    race. Prefers the LIVE Tune-screen slider-widget read (_read_tuning_
+    widgets -- see that function's docstring; verified live 2026-08-14
+    against on-screen ground truth) over the persisted save file, falling
+    back to read_tuning_from_save() only for categories the live read
+    doesn't have (i.e. a tab that hasn't been visited this menu session).
 
     Confirmed live 2026-08-08: the previous behavior (read_tuning_from_save()
     alone, unconditionally, per part 13 in PROJECT.md) can log stale tuning
@@ -1508,16 +1522,18 @@ def read_tuning_for_race(pid: int, car_name: str) -> dict:
     correctly showed SUSPENSION=4 (`hard`), the value the player says was
     actually in use both times.
 
-    The live loadout array doesn't have this lag (it reflects the equipped
-    part immediately, no save required -- see that section's docstring), so
-    it's used first here. Still falls back to the save file per-category
-    (rather than replacing it outright) because the save file is keyed by
-    the *race's own* car name, robust to the player having already moved on
-    to tuning a different car in the garage by the time this race's result
-    is processed -- a narrower edge case than the one this function fixes,
-    but still worth guarding since the live array has no such car-identity
-    check of its own."""
-    live = _read_loadout_tuning(pid)
+    The live widget read doesn't have this lag (it reflects the slider
+    immediately, no save required), so it's used first here. An earlier
+    version of this function used a different live source (the equipped-
+    part "loadout array") that turned out to be actively unreliable -- see
+    the DEMOTED note in that section -- so it has been dropped from this
+    priority chain entirely rather than merged in as a second opinion.
+    Falls back to the save file per-category both for tabs not visited this
+    session AND because the save file is keyed by the *race's own* car
+    name, robust to the player having already moved on to tuning a
+    different car in the garage by the time this race's result is
+    processed."""
+    live = _read_tuning_widgets(pid)
     if len(live) == len(TUNE_CATEGORIES):
         return live
     result = read_tuning_from_save(car_name)
