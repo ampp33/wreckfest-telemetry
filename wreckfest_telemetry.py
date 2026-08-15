@@ -391,16 +391,52 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
     )
 
 
-def _local_player_slot_index(f, table_base: int) -> Optional[int]:
+_LAST_GOOD_CLIENT_SLOT: dict = {}   # pid -> (raw_slot, monotonic_timestamp)
+_CLIENT_SLOT_STALE_FALLBACK_S = 30  # how long a last-known-good reading stays trusted over a fresh -1
+
+
+def _local_player_slot_index(f, table_base: int, pid: Optional[int] = None) -> Optional[int]:
     """CLIENT singleton's first field is the local client's car slot index in
-    multiplayer; -1 (no network client) means solo/AI, which the engine seats at slot 0."""
+    multiplayer; -1 (no network client) means solo/AI, which the engine seats
+    at slot 0 -- but confirmed live 2026-08-14 that this field can ALSO read
+    -1 during a genuine online race with real opponents clearly present
+    (raw_idx=-1 caught directly on the results screen while other real
+    players' results were on screen too) -- almost certainly the CLIENT
+    object going stale once the race itself ends and you're just viewing
+    results, matching the "connected-but-not-actively-racing" theory this
+    project had suspected but never confirmed live before. Blindly trusting
+    -1 -> slot 0 in that situation mislabels whichever entry happens to sit
+    at slot 0 as the local player (silently wrong if slot 0 is a real
+    stranger; silently a no-op, as in the case that caught this, if slot 0 is
+    unpopulated) -- this is the root cause of the "identity misattribution"
+    bug this project's session-level confirmed_local_name guard has been
+    mitigating without ever being able to explain.
+
+    Fix: remember the last raw value that was genuinely > -1 (per pid, with a
+    timestamp) and keep trusting it for a short window even if a later read
+    goes back to -1 -- covers exactly the "results screen briefly resets
+    CLIENT" case without needing to guess online-vs-solo from player count
+    (which doesn't work: a solo/AI race can have just as many populated
+    slots as a networked one). A genuinely solo/AI race never has a
+    known-good value to fall back on, so it still correctly defaults to slot
+    0 as before. The window (_CLIENT_SLOT_STALE_FALLBACK_S) is short enough
+    that it shouldn't bleed a stale value into a completely different next
+    race, which take much longer than that to get back to a results screen."""
     client_obj = _hash_registry_lookup(f, table_base, "CLIENT")
     if not client_obj:
         return None
     raw = ri32(f, client_obj)
     if raw is None:
         return None
-    return raw if raw > -1 else 0
+    if raw > -1:
+        if pid is not None:
+            _LAST_GOOD_CLIENT_SLOT[pid] = (raw, time.monotonic())
+        return raw
+    if pid is not None:
+        cached = _LAST_GOOD_CLIENT_SLOT.get(pid)
+        if cached is not None and (time.monotonic() - cached[1]) < _CLIENT_SLOT_STALE_FALLBACK_S:
+            return cached[0]
+    return 0
 
 
 def _read_player_native_only(f, d: dict) -> PlayerResult:
@@ -449,7 +485,7 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
     )
 
 
-def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int], pairs: list, slot0: Optional[int]) -> None:
+def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int], pairs: list, slot0: Optional[int], pid: Optional[int] = None) -> None:
     """Marks the entry at the CLIENT-derived local slot index. If that slot
     is real (passes validate_entry) but wasn't captured in `pairs` at all --
     e.g. its player_ptr is invalid, so read_player() rejected it entirely --
@@ -462,7 +498,7 @@ def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int],
     path's job instead)."""
     local_player = None
     if module_base is not None and table_base is not None and slot0 is not None:
-        local_slot = _local_player_slot_index(f, table_base)
+        local_slot = _local_player_slot_index(f, table_base, pid)
         if local_slot is not None:
             for addr, p in pairs:
                 if (addr - slot0) // SLOT_STRIDE == local_slot:
@@ -540,7 +576,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 # else currently validates -- a solo/AI race where the local
                 # player's own slot has a bad player_ptr this tick would
                 # otherwise never get the salvage path a chance to run.
-                _mark_local_player(f, module_base, table_base, cached_pairs, min(cached_addrs))
+                _mark_local_player(f, module_base, table_base, cached_pairs, min(cached_addrs), pid)
                 if cached_pairs:
                     cached_players = [p for _, p in cached_pairs]
                     cached_players.sort(key=_position_sort_key)
@@ -578,7 +614,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
             # Always attempt local-player resolution, even if nothing else
             # currently validates -- see the identical comment in the cached
             # branch above.
-            _mark_local_player(f, module_base, table_base, pairs, min(hits))
+            _mark_local_player(f, module_base, table_base, pairs, min(hits), pid)
             if not pairs:
                 return None, None
     except _PROC_ERRORS:
