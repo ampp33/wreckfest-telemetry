@@ -42,21 +42,39 @@ OFF_CLASS_RATING = 16
 OFF_SENTINEL_A   = 20   # always 65535
 OFF_PLAYER_PTR   = 68   # ptr64 -> player/car data block
 
-# addr-32: int32, low bits are a per-slot base value (unrelated), bit 0x100 is
-# set exactly once, at the moment THIS player crosses the finish line -- found
-# by live-diffing the whole struct across a real race (incl. a deliberate
-# pause, to rule out a false positive): each slot's own transition lands at a
-# different real-world time matching actual finish order, and total_time_ms
-# for every slot stops changing for good only once the LAST player's bit is
-# set. This is the real, per-player "has finished" signal -- unlike
-# total_time_ms (a shared, still-ticking clock until each player finishes),
-# it can't be fooled by a pause, a tie, or another player finishing first.
+# addr-32: int32. bit 0x100 was originally read as a one-shot "this player
+# has finished" latch (see the git history for that original reasoning --
+# it looked right at the time, against a race with no DNFs). CORRECTED
+# live 2026-08-15, against a real race with several DNFs deliberately
+# caused: bit 0x100 is just the low bit of byte 1 of this same int32 (addr
+# -31) -- and that byte is a genuine, live-verified LAP COUNTER, not a
+# finish flag. It increments by exactly 1 each time this player completes a
+# lap (confirmed live: a still-racing player's counter climbs, e.g. 7->8,
+# while a DNF'd player's freezes solid), so bit 0x100 just flips on/off
+# with the counter's parity, roughly once per lap time (~20-30s), for every
+# player, all race long -- it is NOT specific to actually finishing. The
+# only reason this ever looked like a working "finished" signal is that a
+# real finisher's counter (and total_time_ms) also happen to freeze at the
+# same moment their last lap completes, since there's no next lap to flip
+# it back -- purely incidental, and it fails exactly the way you'd expect
+# once a DNF is in the mix: a dead/DNF'd player's counter can freeze on
+# either parity depending on when they died, so this bit reads True or
+# False for a DNF at random. See laps_completed on PlayerResult / the new
+# OFF_LAP_COUNTER byte below for the real, verified-reliable signal.
 OFF_FINISHED_FLAG = -32
 FINISHED_BIT       = 0x100
+# addr-31: single byte, byte 1 of the same int32 above. The real lap
+# counter -- see the comment above for how this was found and verified.
+# Read as (flag_word >> 8) & 0xFF from the same ri32 read as FINISHED_BIT,
+# rather than a separate memory read.
+OFF_LAP_COUNTER    = -31
 
 POFF_NAME   = 0
-POFF_CAR    = 48
-POFF_ENGINE = 288
+# POFF_CAR/POFF_ENGINE (used to be 48/288) are gone -- car name now comes
+# from the roster car-name table (see resolve_car_names() below), which is
+# both more reliable (doesn't go through the per-player struct at all, so
+# it isn't affected by a car asset still streaming in) and doesn't need a
+# per-player offset. Engine name was dropped entirely, unused downstream.
 
 SENTINEL = struct.pack('<ii', 65_535, -1_000_000)
 
@@ -99,14 +117,25 @@ class PlayerResult:
     position:      int
     name:          str
     car:           str
-    engine:        str
     class_letter:  str
     class_rating:  int
     best_lap_ms:   int
     total_time_ms: int
     lap_times_ms:  list
     is_local:      bool = False
-    finished:      bool = False   # this player's own OFF_FINISHED_FLAG bit is set
+    finished:      bool = False   # this player's own OFF_FINISHED_FLAG bit is set -- see that constant's docstring, this is NOT a reliable "did they really finish" signal by itself
+    # Real lap-completion count, from OFF_LAP_COUNTER -- see that constant's
+    # docstring. Verified live 2026-08-15 against a race with 4 real DNFs:
+    # the 2 genuine finishers both froze at 4 (the race's real lap count),
+    # every DNF froze at 3 or lower. _position_sort_key() ranks on this
+    # first, precisely so a DNF's misleadingly-low frozen total_time_ms
+    # can't outrank someone who actually completed more of the race.
+    laps_completed: int = 0
+    # Index into the 24-slot player array (0-23), set by scrape_players() --
+    # not identity/gameplay data, just plumbing so resolve_car_names() can
+    # map this player back to their row in the car-name table (see that
+    # section) without needing to re-derive it from a raw slot address.
+    slot_index:    Optional[int] = None
 
     def class_str(self) -> str:
         return f"{self.class_letter} {self.class_rating}"
@@ -217,19 +246,6 @@ _COLOR_CODE_RE = re.compile(r'\*\^[0-9]|\^[0-9]')
 
 def _strip_color_codes(name: str) -> str:
     return _COLOR_CODE_RE.sub('', name).strip()
-
-
-_VEHICLE_NAME_RE = re.compile(rb'VEHICLE_NAME_[0-9]+_[0-9]+')
-
-
-def _find_nearby_vehicle_name_key(f, near_addr: int, window: int = 256) -> Optional[str]:
-    """Recovers an unresolved VEHICLE_NAME_<id>_<variant> template key sitting
-    near a garbled car-name field (asset still streaming in)."""
-    blob = _rd(f, near_addr, window)
-    if not blob:
-        return None
-    m = _VEHICLE_NAME_RE.search(blob)
-    return m.group(0).decode('ascii') if m else None
 
 
 # ── struct discovery ──────────────────────────────────────────────────────────
@@ -351,43 +367,36 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
     if not ptr or ptr < MIN_HEAP_PTR or ptr > (1 << 47):
         return None
 
-    name   = _strip_color_codes(rcstr(f, ptr + POFF_NAME, 64))
-    car    = rcstr(f, ptr + POFF_CAR,    64)
-    engine = rcstr(f, ptr + POFF_ENGINE, 32)
-
+    name = _strip_color_codes(rcstr(f, ptr + POFF_NAME, 64))
     if not name:
         return None
-    if _looks_garbled(engine):
-        engine = ""
-    if car and car[0] in ('+', '-') and ':' in car:
-        return None   # looks like a time-delta string -- stray pointer
 
     laps = [d['best_lap_ms']] if MIN_LAP_MS <= d['best_lap_ms'] <= MAX_LAP_MS else []
 
-    # Car name may be an unresolved "VEHICLE_NAME_<id>_<variant>" localization
-    # key (asset still streaming in), or outright garbled with the key sitting
-    # nearby instead -- resolve either case via the loc-string table.
-    if module_base is not None and table_base is not None and car.startswith("VEHICLE_NAME_"):
-        resolved = _resolve_localized_string(f, module_base, table_base, car)
-        if resolved:
-            car = resolved
-    elif module_base is not None and table_base is not None and _looks_garbled(car):
-        key = _find_nearby_vehicle_name_key(f, ptr + POFF_CAR)
-        if key:
-            resolved = _resolve_localized_string(f, module_base, table_base, key)
-            car = resolved if resolved else ""
-        else:
-            car = ""
-
+    # car is deliberately left blank here -- resolve_car_names() fills it in
+    # for every player at once, once per finalized race, from the roster
+    # car-name table (see that section's docstring for why: the per-player
+    # struct's own car field, read straight off `ptr` the way this function
+    # used to, can sit on outright garbage -- a leftover float, an
+    # unresolved VEHICLE_NAME_<id>_<variant> template key -- for a
+    # noticeable window while a car asset is still streaming in; the roster
+    # table doesn't have that problem, confirmed live 2026-08-15). Dropped
+    # along with it: the VEHICLE_NAME/_resolve_localized_string patch-up
+    # this used to do here (moot, nothing left to patch up), and a
+    # time-delta-shaped-string stray-pointer guard that used to piggyback
+    # on the old car field as a validity signal for `ptr` -- MIN_HEAP_PTR
+    # plus the non-empty-name check above are what's left guarding against
+    # a bad player_ptr now.
     flag = ri32(f, d['addr'] + OFF_FINISHED_FLAG)
     finished = bool(flag is not None and flag & FINISHED_BIT)
+    laps_completed = ((flag & 0xFFFFFFFF) >> 8) & 0xFF if flag is not None else 0
 
     return PlayerResult(
-        position=0, name=name, car=car, engine=engine,
+        position=0, name=name, car="",
         class_letter=class_from_rating(d['class_rating']),
         class_rating=d['class_rating'], best_lap_ms=d['best_lap_ms'],
         total_time_ms=d['total_time_ms'], lap_times_ms=laps, is_local=False,
-        finished=finished,
+        finished=finished, laps_completed=laps_completed,
     )
 
 
@@ -468,6 +477,7 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
     laps = [d['best_lap_ms']] if MIN_LAP_MS <= d['best_lap_ms'] <= MAX_LAP_MS else []
     flag = ri32(f, d['addr'] + OFF_FINISHED_FLAG)
     finished = bool(flag is not None and flag & FINISHED_BIT)
+    laps_completed = ((flag & 0xFFFFFFFF) >> 8) & 0xFF if flag is not None else 0
 
     name = ""
     ptr = ru64(f, d['addr'] + OFF_PLAYER_PTR)
@@ -477,11 +487,11 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
             name = _strip_color_codes(candidate)
 
     return PlayerResult(
-        position=0, name=name, car="", engine="",
+        position=0, name=name, car="",
         class_letter=class_from_rating(d['class_rating']),
         class_rating=d['class_rating'], best_lap_ms=d['best_lap_ms'],
         total_time_ms=d['total_time_ms'], lap_times_ms=laps, is_local=False,
-        finished=finished,
+        finished=finished, laps_completed=laps_completed,
     )
 
 
@@ -509,6 +519,7 @@ def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int],
                 d = validate_entry(f, addr)
                 if d is not None:
                     local_player = _read_player_native_only(f, d)
+                    local_player.slot_index = local_slot
                     pairs.append((addr, local_player))
     if local_player is None:
         if not pairs:
@@ -534,20 +545,202 @@ def resolve_local_car_name(pid: int, players: list) -> None:
         return
 
 
+# ── car names, live (roster car-name table) ──────────────────────────────────
+# Confirmed live 2026-08-15 (two separate races, one online, one offline):
+# a small, fixed-stride (0x80-byte) array holds one all-caps, null-terminated
+# car name per player slot, in the SAME order as the 24-slot player array
+# (table slot N == player-array slot N -- verified by cross-checking against
+# the local player's own car name, already independently known via
+# _local_player_car_name() above, at the local player's own known slot
+# index). This is a materially more reliable source than the old
+# per-player-struct read it replaces: caught live, repeatedly, a car whose
+# asset is still streaming in reads as outright garbage at the old fixed
+# struct offset (a leftover float, an unresolved
+# "VEHICLE_NAME_<id>_<variant>" template key) for a real window of time,
+# while this table already had the correct, resolved, human-readable name.
+# Also confirmed persistent across races within one game session -- same
+# base address, overwritten in place each race, not reallocated -- but there
+# is no known static pointer chain to it (unlike the main player array), so
+# it has to be structurally re-discovered per pid, same as the sentinel-scan
+# fallback for the player array itself.
+_CAR_NAME_TABLE_STRIDE = 0x80
+_CAR_NAME_TOKEN_RE = re.compile(rb'[A-Z][A-Z ]{2,19}\x00')
+_CAR_NAME_TABLE_CACHE: dict = {}   # pid -> base address of table slot 0
+
+
+def _stride_runs(hits: list, stride: int, min_run: int = 2) -> list:
+    """All runs of hits spaced exactly `stride` bytes apart, each >= min_run
+    long -- like cluster_sentinel_hits, but returns every run instead of
+    just the longest one. Car-table discovery needs that: confirmed live
+    other same-shape, same-stride tables exist elsewhere in memory (a
+    race-mode-name list, a couple of unrelated repeated-tag tables) and can
+    legitimately be longer than the real one, so "longest run wins" isn't
+    safe here the way it is for the sentinel scan."""
+    if len(hits) < min_run:
+        return []
+    sorted_hits = sorted(hits)
+    runs = []
+    current = [sorted_hits[0]]
+    for addr in sorted_hits[1:]:
+        if addr - current[-1] == stride:
+            current.append(addr)
+        else:
+            if len(current) >= min_run:
+                runs.append(current)
+            current = [addr]
+    if len(current) >= min_run:
+        runs.append(current)
+    return runs
+
+
+def _find_car_name_table(pid: int, local_slot: int, local_car_name: str) -> Optional[int]:
+    """Structural discovery of the car-name table. Expensive -- scans every
+    anonymous writable region (multiple seconds) -- callers must cache the
+    result; only ever needs to succeed once per pid. A candidate run is only
+    trusted once `local_car_name` (already resolved independently and
+    reliably by _local_player_car_name(), not through this table or the old
+    per-player struct field) shows up at that same run's `local_slot`
+    entry -- content match at the one position we can already verify,
+    not just structural shape alone."""
+    regions = anon_writable_regions(pid)
+    hits = []
+    CHUNK = 8 * 1024 * 1024
+    overlap = 24  # >= longest possible token, so a match split across a chunk boundary is never missed
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as f:
+            for start, end in regions:
+                size = end - start
+                offset = 0
+                try:
+                    f.seek(start)
+                except OSError:
+                    continue
+                prev_tail = b""
+                while offset < size:
+                    n = min(CHUNK, size - offset)
+                    try:
+                        chunk = f.read(n)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    hay = prev_tail + chunk
+                    hay_base = start + offset - len(prev_tail)
+                    for m in _CAR_NAME_TOKEN_RE.finditer(hay):
+                        hits.append(hay_base + m.start())
+                    prev_tail = chunk[-overlap:]
+                    offset += len(chunk)
+    except _PROC_ERRORS:
+        return None
+
+    runs = _stride_runs(hits, _CAR_NAME_TABLE_STRIDE)
+    if not runs:
+        return None
+
+    target = local_car_name.upper()
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as f:
+            for run in runs:
+                if local_slot >= len(run):
+                    continue
+                if rcstr(f, run[local_slot], 32).upper() == target:
+                    return run[0]
+    except _PROC_ERRORS:
+        return None
+    return None
+
+
+def _get_car_name_table(pid: int, local_slot: Optional[int], local_car_name: Optional[str]) -> Optional[int]:
+    """Cached lookup -- discovery is expensive, the table's base address
+    isn't (confirmed stable across two separate races in the same game
+    session)."""
+    cached = _CAR_NAME_TABLE_CACHE.get(pid)
+    if cached is not None:
+        return cached
+    if local_slot is None or not local_car_name:
+        return None   # can't validate a candidate yet -- caller can retry next race
+    base = _find_car_name_table(pid, local_slot, local_car_name)
+    if base is not None:
+        _CAR_NAME_TABLE_CACHE[pid] = base
+    return base
+
+
+def read_car_names(pid: int, local_slot: Optional[int], local_car_name: Optional[str]) -> dict:
+    """slot_index -> car name (Title Case), for every populated slot. Reads
+    fresh every call -- cheap once the table's base address is cached, and
+    deliberately not cached itself, so a slot whose car is still streaming
+    in the first time this runs picks up the real value automatically on a
+    later call, no restart needed. NOTE: Title Case is a lossy
+    reconstruction of the table's all-caps text -- confirmed live it's
+    correct for every car name seen so far except one: "ROADSLAYER" (whose
+    real display name has an internal capital, "RoadSlayer") comes back as
+    "Roadslayer". Known, narrow, cosmetic-only limitation, not chased
+    further since it doesn't affect identity/matching anywhere downstream."""
+    base = _get_car_name_table(pid, local_slot, local_car_name)
+    if base is None:
+        return {}
+    result = {}
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as f:
+            for i in range(MAX_PLAYERS):
+                val = rcstr(f, base + i * _CAR_NAME_TABLE_STRIDE, 32)
+                if val:
+                    result[i] = val.title()
+    except _PROC_ERRORS:
+        pass
+    return result
+
+
+def resolve_car_names(pid: int, players: list) -> None:
+    """Fills in every OTHER player's car name (not the local player's -- see
+    below) from the roster car-name table. Call once per new race (not
+    every tick), and AFTER resolve_local_car_name(): this function reuses
+    its result both as the trusted value table discovery validates against,
+    and, deliberately, as the local player's own final car name --
+    _local_player_car_name() reads the game's own loc-string table directly
+    and gets the byte-exact display name (e.g. "RoadSlayer", "KillerBee S"),
+    while this table only round-trips through Title Case (see
+    read_car_names()'s docstring -- lossy for a name with an internal
+    capital). Overwriting the local player's already-correct value with the
+    lossy one right before read_tuning_for_race() matches it against
+    cars5.ccrs's exact-cased catalog would be a straight regression, so it's
+    left alone here."""
+    local_player = next((p for p in players if p.is_local), None)
+    local_car_name = local_player.car if local_player else None
+    local_slot = local_player.slot_index if local_player else None
+    if _CAR_NAME_TABLE_CACHE.get(pid) is None:
+        print(f"[{_ts()}] Locating car-name table (one-time this session, ~10s)...")
+    car_names = read_car_names(pid, local_slot, local_car_name)
+    for p in players:
+        if p.is_local:
+            continue
+        if p.slot_index is not None and p.slot_index in car_names:
+            p.car = car_names[p.slot_index]
+
+
 def _position_sort_key(p: PlayerResult) -> tuple:
-    """Ranks finished players by total_time_ms first, unfinished players
-    after (also by total_time_ms, as a stable tiebreak -- meaningless as an
-    actual ranking, but keeps output deterministic). Plain total_time_ms
-    alone isn't safe to sort the whole field by: confirmed live 2026-08-08
-    a still-racing/DNF'd straggler's total_time_ms can sit well BELOW the
-    genuinely-finished pack's (e.g. a FINISHED_BIT blip early in the race
-    froze their clock at an early, low value -- the same per-player
-    mid-race-blip failure mode _race_is_final()'s own docstring already
-    describes, just observed here in a real networked opponent instead of
-    the local player) -- sorting on total_time_ms alone let that straggler
-    outrank everyone who'd actually completed the race, including bumping
-    the actual winner down to 2nd in a real logged result."""
-    return (not p.finished, p.total_time_ms)
+    """Ranks by laps_completed first (descending -- more laps completed
+    always outranks fewer), total_time_ms as the tiebreak within an equal
+    lap count. Plain total_time_ms alone isn't safe to sort the whole field
+    by: confirmed live 2026-08-08 a still-racing/DNF'd straggler's
+    total_time_ms can sit well BELOW the genuinely-finished pack's -- and
+    confirmed again live 2026-08-15, this time root-caused: OFF_FINISHED_FLAG
+    (the old `finished`-based first sort key) was never a real "did they
+    finish" signal, just the parity of the same lap counter this function
+    now sorts on directly (see OFF_LAP_COUNTER's docstring) -- it flips on
+    and off roughly once a lap for every player, racing or not, so a DNF's
+    frozen total_time_ms could get sorted above real finishers depending on
+    which parity their counter happened to freeze on. laps_completed
+    doesn't have that problem: verified live against a real race with 4
+    DNFs, the 2 genuine finishers both froze at the race's real lap count
+    (4) while every DNF froze at 3 or lower, cleanly separating them
+    regardless of raw elapsed time. (No known way yet to compare a DNF's
+    progress *within* an equal lap count more precisely than total_time_ms
+    -- confirmed live this doesn't perfectly reproduce the real relative
+    order of multiple same-lap-count DNFs, so treat sub-ordering among tied
+    DNFs as best-effort, not verified, unlike the finished-vs-DNF split
+    itself.)"""
+    return (-p.laps_completed, p.total_time_ms)
 
 
 def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
@@ -562,6 +755,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
     if cached_addrs:
         try:
             with _mem_and_bases(pid) as (f, module_base, table_base):
+                slot0 = min(cached_addrs)
                 cached_pairs = []
                 seen_names: set = set()
                 for addr in cached_addrs:
@@ -571,12 +765,13 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                     p = read_player(f, d, module_base, table_base)
                     if p and p.name not in seen_names:
                         seen_names.add(p.name)
+                        p.slot_index = (addr - slot0) // SLOT_STRIDE
                         cached_pairs.append((addr, p))
                 # Always attempt local-player resolution, even if nothing
                 # else currently validates -- a solo/AI race where the local
                 # player's own slot has a bad player_ptr this tick would
                 # otherwise never get the salvage path a chance to run.
-                _mark_local_player(f, module_base, table_base, cached_pairs, min(cached_addrs), pid)
+                _mark_local_player(f, module_base, table_base, cached_pairs, slot0, pid)
                 if cached_pairs:
                     cached_players = [p for _, p in cached_pairs]
                     cached_players.sort(key=_position_sort_key)
@@ -601,6 +796,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
     seen_names: set = set()
     try:
         with _mem_and_bases(pid) as (f, module_base, table_base):
+            slot0 = min(hits)
             for addr in hits:
                 d = validate_entry(f, addr)
                 if d is None:
@@ -609,12 +805,13 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 if p is None or p.name in seen_names:
                     continue
                 seen_names.add(p.name)
+                p.slot_index = (addr - slot0) // SLOT_STRIDE
                 pairs.append((addr, p))
 
             # Always attempt local-player resolution, even if nothing else
             # currently validates -- see the identical comment in the cached
             # branch above.
-            _mark_local_player(f, module_base, table_base, pairs, min(hits), pid)
+            _mark_local_player(f, module_base, table_base, pairs, slot0, pid)
             if not pairs:
                 return None, None
     except _PROC_ERRORS:
@@ -1618,7 +1815,6 @@ def _player_to_dict(p: PlayerResult) -> dict:
         "position":      p.position,
         "name":          p.name,
         "car":           p.car,
-        "engine":        p.engine,
         "class":         p.class_str(),
         "best_lap_ms":   p.best_lap_ms,
         "total_time_ms": p.total_time_ms,
@@ -1913,6 +2109,7 @@ def main():
                         for a in cached_addrs:
                             print(f"[debug]   slot @ 0x{a:016x}")
                     resolve_local_car_name(pid, players)
+                    resolve_car_names(pid, players)
                     track, variation = detect_track_and_variation(pid)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
                     # Tuning to attach to this race -- live loadout array
