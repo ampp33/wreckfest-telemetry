@@ -69,6 +69,64 @@ FINISHED_BIT       = 0x100
 # rather than a separate memory read.
 OFF_LAP_COUNTER    = -31
 
+# Per-player status bitfield, found live 2026-08-15 by diffing ~19 candidate
+# offsets across all 24 slots through a real 24-player race. Mid-race it
+# reads 0 or 4; it takes a terminal value the moment that player's result is
+# finalized. Two bits are verified and used:
+#
+#   STATUS_RUN_COMPLETE_BIT (0x40) -- badly named, kept only to avoid churn.
+#     **It is NOT the local player.** Best current evidence (2026-08-16,
+#     online): it marks a racer whose run is COMPLETE -- seven slots carried
+#     it simultaneously in a 22-player race, exactly the racers who had
+#     finished, while others were still circulating; by the results screen
+#     nearly the whole field had it.
+#     It looked like a local-player flag for one structural reason: every
+#     race it had been tested against was offline, where the local player is
+#     the only human and (finishing normally) the only slot to end up with
+#     it set at the moment it was sampled. It was briefly promoted to the
+#     primary identity source on 2026-08-15 and a single real online race
+#     disproved it -- the bit sat on `TiamaT` (the winner) while the local
+#     player was `Ampp33` at another slot, and CLIENT was correct.
+#     Do NOT use for identity. It IS used, scoped to the LOCAL player only,
+#     as the finality edge in _race_is_final() -- "this player's own run is
+#     over" is exactly what that check wants. Never test it across the whole
+#     field: that fires when the leader finishes, not when the local player
+#     does.
+#
+#   STATUS_DNF_BIT (0x10) -- "this player did not finish". Verified across
+#     two opposite scenarios: a 24-player online race where exactly 6 slots
+#     carried it and the user independently reported exactly 6 DNFs, and an
+#     offline race where all 24 carried it and the user confirmed nobody
+#     finished. No finisher has ever carried it. This is the project's first
+#     real DNF signal -- everything before it inferred DNF status indirectly
+#     from the lap counter.
+#
+# TIMING, important: this field is populated when results finalize, NOT
+# maintained live during the race (confirmed live -- 0x40 was absent on
+# every sample from green flag to finish, then appeared). That makes its
+# appearance a genuine "this race is over for the local player" edge, which
+# is exactly what _race_is_final() needs and what FINISHED_BIT never was.
+# BYTE 0 of the same int32 as OFF_FINISHED_FLAG/OFF_LAP_COUNTER: the game's
+# own FINISHING POSITION, zero-indexed (so position = byte + 1). Found live
+# 2026-08-15 by taking a real 24-car race's in-game finishing order from the
+# user and searching every field in and around the slot struct for one that
+# reproduces it -- this byte matched all 24 exactly, finishers and DNFs
+# alike, values 0..23 with no duplicates. Confirmed against two independent
+# ground truths: the local player read 1 for a user-confirmed 2nd place, and
+# the 15-strong DNF block matched the results screen's order name for name.
+#
+# This retires every heuristic the project used to guess ordering. It is
+# also the answer to the DNF sub-ordering problem that had been open since
+# the lap counter was found: the engine ranks DNFs by order of death, first
+# out placed last (user-confirmed), and this byte already encodes that --
+# something neither total_time_ms direction could reproduce, because time
+# only correlates with progress while a car is actually moving (a wrecked
+# car crawling for 90s can outlast the field while placing dead last).
+OFF_FINISH_POSITION = -32   # byte 0 of the OFF_FINISHED_FLAG word
+OFF_STATUS_FLAGS  = -36
+STATUS_RUN_COMPLETE_BIT  = 0x40
+STATUS_DNF_BIT    = 0x10
+
 POFF_NAME   = 0
 # POFF_CAR/POFF_ENGINE (used to be 48/288) are gone -- car name now comes
 # from the roster car-name table (see resolve_car_names() below), which is
@@ -131,6 +189,15 @@ class PlayerResult:
     # first, precisely so a DNF's misleadingly-low frozen total_time_ms
     # can't outrank someone who actually completed more of the race.
     laps_completed: int = 0
+    # Raw per-player status bitfield from OFF_STATUS_FLAGS -- see that
+    # constant for the verified bits. 0 means "not populated yet" (mid-race,
+    # or a slot that never finalized), which is meaningful in itself:
+    # _race_is_final() keys off STATUS_RUN_COMPLETE_BIT appearing here.
+    status_flags:   int = 0
+    # The engine's own finishing position, 1-based (see OFF_FINISH_POSITION).
+    # 0 means "not read / not populated", which _rank_players() treats as
+    # unusable and falls back on.
+    finish_position: int = 0
     # Index into the 24-slot player array (0-23), set by scrape_players() --
     # not identity/gameplay data, just plumbing so resolve_car_names() can
     # map this player back to their row in the car-name table (see that
@@ -139,6 +206,25 @@ class PlayerResult:
 
     def class_str(self) -> str:
         return f"{self.class_letter} {self.class_rating}"
+
+    @property
+    def dnf(self) -> bool:
+        """True if the engine itself marked this player as not finishing.
+        Only meaningful once status_flags is populated (results finalized);
+        reads False mid-race, which is the correct answer then anyway."""
+        return bool(self.status_flags & STATUS_DNF_BIT)
+
+    @property
+    def run_complete(self) -> bool:
+        """True if the engine flagged this exact slot as the local player.
+        Appears only once results finalize (see OFF_STATUS_FLAGS), which is
+        why _race_is_final() can use its presence as the finality edge.
+
+        Deliberately NOT inferring finality from any other bit: bit 0x01 is
+        set on every terminal value but was observed flickering 0->1->0
+        mid-race (20 and 7 transitions in one race), so only the two bits
+        that have actually been verified stable are trusted here."""
+        return bool(self.status_flags & STATUS_RUN_COMPLETE_BIT)
 
     def __eq__(self, other):
         return (isinstance(other, PlayerResult)
@@ -390,6 +476,8 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
     flag = ri32(f, d['addr'] + OFF_FINISHED_FLAG)
     finished = bool(flag is not None and flag & FINISHED_BIT)
     laps_completed = ((flag & 0xFFFFFFFF) >> 8) & 0xFF if flag is not None else 0
+    status_flags = ri32(f, d['addr'] + OFF_STATUS_FLAGS) or 0
+    finish_position = (flag & 0xFF) + 1 if flag is not None else 0
 
     return PlayerResult(
         position=0, name=name, car="",
@@ -397,8 +485,22 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
         class_rating=d['class_rating'], best_lap_ms=d['best_lap_ms'],
         total_time_ms=d['total_time_ms'], lap_times_ms=laps, is_local=False,
         finished=finished, laps_completed=laps_completed,
+        status_flags=status_flags, finish_position=finish_position,
     )
 
+
+# pid -> number of REAL racers (named, occupied slots) whose status field has
+# no terminal marker yet, i.e. who are still circulating. Set by
+# scrape_players() from the raw slot array on every poll, and read by
+# _race_is_final() to decide whether the results screen has been reached.
+#
+# Why this can't be derived from the returned player list: a racer who is
+# still out on track and hasn't completed a lap has neither a valid lap time
+# (so validate_entry rejects them) nor a terminal status (so
+# _validate_any_slot_relaxed rejects them too), which makes them invisible in
+# `players` at exactly the moment they most need to block a premature
+# "results are in" verdict.
+_STILL_RACING_COUNT: dict = {}
 
 _LAST_GOOD_CLIENT_SLOT: dict = {}   # pid -> (raw_slot, monotonic_timestamp)
 _CLIENT_SLOT_STALE_FALLBACK_S = 30  # how long a last-known-good reading stays trusted over a fresh -1
@@ -492,37 +594,275 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
         class_rating=d['class_rating'], best_lap_ms=d['best_lap_ms'],
         total_time_ms=d['total_time_ms'], lap_times_ms=laps, is_local=False,
         finished=finished, laps_completed=laps_completed,
+        status_flags=ri32(f, d['addr'] + OFF_STATUS_FLAGS) or 0,
+        finish_position=(flag & 0xFF) + 1 if flag is not None else 0,
     )
 
 
+def _validate_local_slot_relaxed(f, addr: int) -> Optional[dict]:
+    """validate_entry() for the ONE slot CLIENT has already independently
+    named as the local player's -- with the lap-time plausibility floors
+    dropped, because for this slot they reject the exact case they were
+    never meant to judge.
+
+    Why this is needed (root cause of the 2026-08-15 identity
+    misattribution, traced statically 2026-08-15 through the code path the
+    live symptom implicates -- see below for what is and isn't verified):
+    validate_entry() requires `MIN_LAP_MS <= best_lap` and
+    `MIN_LAP_MS <= total_time`. A player who times out having completed
+    ZERO laps never posts a lap time at all, so their slot's best_lap is
+    unset and the check rejects it -- even though the slot is a real,
+    seated, correctly-identified racer. That single rejection used to
+    cascade all the way to a wrong name being labelled "you":
+      1. scrape_players() skips the slot -> the local player is missing
+         from `pairs` entirely (matches the observed symptom exactly: 5
+         rows logged for a 6-racer heat, real local player absent);
+      2. _mark_local_player()'s slot-index loop correctly finds nothing;
+      3. its salvage path re-ran *the same* validate_entry() and so failed
+         for the very same reason, leaving local_player None;
+      4. control reached the lowest-address fallback, which cheerfully
+         labelled whichever other racer happened to sit in the lowest slot
+         as the local player.
+    So the misattribution never required CLIENT to return a wrong index at
+    all (PROJECT.md's 2026-08-15 entry #3 guessed it did) -- CLIENT was
+    most likely correct the whole time, and the bug lived entirely
+    downstream of it. Both possibilities are covered now regardless: the
+    lowest-address fallback is no longer reachable once CLIENT resolves
+    anything (see _mark_local_player).
+
+    The floors exist to keep the *sentinel scan* from trusting random
+    memory that happens to look struct-shaped. This slot didn't come from
+    that scan -- CLIENT named it -- so those particular heuristics are
+    buying nothing here. What still has to be proven is that the seat is
+    OCCUPIED, since an empty slot also reads zeroes and must never be
+    salvaged into a phantom local player (that would fabricate a 1-player
+    "race" out of an idle menu). Two independent occupancy proofs are
+    required instead of the lap floors:
+      - a class rating in the plausible range: set at race start, before a
+        single lap is completed, so it's populated for a 0-lap racer but
+        not for a genuinely empty seat;
+      - a real, non-garbled name behind player_ptr.
+    Unset lap/total times are then clamped to 0 rather than rejected -- 0
+    is the honest value for "completed no laps", and laps_completed (the
+    reliable signal, see OFF_LAP_COUNTER) carries the real ranking
+    information anyway.
+
+    Deliberately used only as a SECOND attempt, after the strict
+    validate_entry() has already failed, so nothing about the existing
+    bad-player_ptr salvage path changes. The one case neither tier can
+    cover is a slot with BOTH a bad player_ptr and no laps completed --
+    that is genuinely indistinguishable from an empty seat with this
+    information, and is left uncovered on purpose rather than guessed at.
+
+    NOT yet verified live: the game wasn't running when this was written,
+    so the "best_lap is unset for a 0-lap timeout" premise is deduced from
+    the observed symptom (the local player's absence from `pairs` is only
+    explainable by validate_entry rejecting the slot; a bad player_ptr
+    alone would have hit the old salvage path and produced a real, if
+    degraded, local entry) rather than read off the live struct. Worth
+    confirming with the same raw-struct tracer used for OFF_LAP_COUNTER
+    next time a local-player timeout can be induced."""
+    return _validate_slot_relaxed(f, addr, require_status_marker=False)
+
+
+def _validate_any_slot_relaxed(f, addr: int) -> Optional[dict]:
+    """The same relaxed validation, for ANY slot rather than just the local
+    player's -- but requiring the engine's own status field to vouch for the
+    slot first.
+
+    Why this exists: the lap-time floors don't only drop the local player,
+    they drop *every* racer who completed zero laps. Caught live 2026-08-15 --
+    an offline race where all 24 cars DNF'd (most at 0 laps) logged as a
+    **4-row** result, because only the three racers who had set a lap time
+    survived `validate_entry()`. The other 20 were real, named, classified
+    racers and simply vanished from the logged race.
+
+    The local-player path (above) can afford to skip a status check because
+    CLIENT has already independently named that exact slot. There is no such
+    external witness for an arbitrary slot, so this requires a terminal
+    marker in the status field -- STATUS_DNF_BIT or STATUS_RUN_COMPLETE_BIT
+    -- as proof the engine itself has classified this slot as a real
+    participant with a settled result. That is a much stronger
+    occupancy proof than name-plus-class-rating alone, and it is what makes
+    widening the net safe here: an empty seat never gets a terminal status,
+    and stale mid-race slots read 0 or 4 (bit 0x01 flickers mid-race and is
+    deliberately NOT accepted as a marker -- see PlayerResult.run_complete).
+
+    Note this admits a player who DNFs *mid-race* as soon as the engine flags
+    them, which is correct: they are genuinely out, and their result is
+    settled even though the race continues."""
+    status = ri32(f, addr + OFF_STATUS_FLAGS)
+    if not status or not (status & (STATUS_DNF_BIT | STATUS_RUN_COMPLETE_BIT)):
+        return None
+    return _validate_slot_relaxed(f, addr, require_status_marker=True)
+
+
+def _validate_slot_relaxed(f, addr: int, require_status_marker: bool) -> Optional[dict]:
+    """Shared core of the two relaxed validators above. Drops validate_entry()'s
+    lap-time floors (clamping unset times to 0 instead of rejecting) while
+    still requiring real occupancy: a plausible class rating, set at race
+    start before any lap completes, and a readable non-garbled name behind
+    player_ptr. `require_status_marker` is handled by the callers."""
+    total_time   = ri32(f, addr + OFF_TOTAL_TIME)
+    best_lap     = ri32(f, addr + OFF_BEST_LAP)
+    class_rating = ri32(f, addr + OFF_CLASS_RATING)
+
+    if any(v is None for v in [total_time, best_lap, class_rating]):
+        return None
+    if not (50 <= class_rating <= 600):
+        return None
+
+    ptr = ru64(f, addr + OFF_PLAYER_PTR)
+    if not ptr or ptr < MIN_HEAP_PTR or ptr > (1 << 47):
+        return None
+    name = _strip_color_codes(rcstr(f, ptr + POFF_NAME, 64))
+    if not name or _looks_garbled(name):
+        return None
+
+    if not (MIN_LAP_MS <= best_lap <= MAX_LAP_MS):
+        best_lap = 0
+    if not (MIN_LAP_MS <= total_time <= MAX_TOTAL_MS):
+        total_time = 0
+
+    return {'addr': addr, 'total_time_ms': total_time, 'best_lap_ms': best_lap, 'class_rating': class_rating}
+
+
+def _count_still_racing(f, slot0: int, pid: Optional[int]) -> None:
+    """Records how many real racers have no terminal status marker yet.
+
+    Walks the raw slot array rather than the validated player list, because a
+    racer still circulating without a completed lap appears in neither (see
+    _STILL_RACING_COUNT). "Real racer" means an occupied seat: a readable,
+    non-garbled name behind player_ptr plus a plausible class rating -- the
+    same occupancy proof the relaxed validators use, so an empty seat (which
+    also has no terminal marker) can't hold the results screen off forever."""
+    if pid is None:
+        return
+    still = 0
+    for i in range(MAX_PLAYERS):
+        addr = slot0 + i * SLOT_STRIDE
+        st = ri32(f, addr + OFF_STATUS_FLAGS)
+        if st is None or (st & (STATUS_RUN_COMPLETE_BIT | STATUS_DNF_BIT)):
+            continue
+        rating = ri32(f, addr + OFF_CLASS_RATING)
+        if rating is None or not (50 <= rating <= 600):
+            continue
+        ptr = ru64(f, addr + OFF_PLAYER_PTR)
+        if not ptr or ptr < MIN_HEAP_PTR or ptr > (1 << 47):
+            continue
+        name = _strip_color_codes(rcstr(f, ptr + POFF_NAME, 64))
+        if name and not _looks_garbled(name):
+            still += 1
+    _STILL_RACING_COUNT[pid] = still
+
+
 def _mark_local_player(f, module_base: Optional[int], table_base: Optional[int], pairs: list, slot0: Optional[int], pid: Optional[int] = None) -> None:
-    """Marks the entry at the CLIENT-derived local slot index. If that slot
-    is real (passes validate_entry) but wasn't captured in `pairs` at all --
-    e.g. its player_ptr is invalid, so read_player() rejected it entirely --
-    salvages a degraded entry from the slot's own native fields instead of
-    silently dropping the local player's real result. Falls back to lowest
-    address only if CLIENT itself can't resolve a slot index at all (this
-    fallback is genuinely "wrong in general" -- it can mislabel a real
-    networked player as local -- so it must never be reached just because
-    the local slot's player_ptr happened to be bad; that's the salvage
-    path's job instead)."""
+    """Marks the local player's entry, resolving their slot index from
+    CLIENT's hash-registry lookup.
+
+    The status field is deliberately NOT consulted for identity. `0x40` was
+    briefly used as the primary source on 2026-08-15 -- it had matched the
+    local player in four offline races -- and one real online race disproved
+    it: the bit marks a racer whose RUN IS COMPLETE, not the local player,
+    and seven slots carried it at once. See STATUS_RUN_COMPLETE_BIT.
+
+    If the resolved slot is real but wasn't captured in `pairs` at all --
+    e.g. its player_ptr is invalid, so read_player() rejected it entirely, or
+    it belongs to a racer who completed zero laps, so validate_entry()'s
+    lap-time floors rejected it -- salvages a degraded entry from the slot's
+    own native fields instead of silently dropping the local player's real
+    result. Two tiers: the strict validate_entry() first (unchanged), then
+    _validate_local_slot_relaxed() (see its docstring -- that's the 0-lap
+    case, and the root cause of the 2026-08-15 misattribution bug).
+
+    Falls back to lowest address ONLY if CLIENT couldn't resolve a slot
+    index at all. That fallback is wrong in general -- it can mislabel a
+    real networked player as local -- so once CLIENT *has* named a slot,
+    its answer is the only one used: if no entry can be built there, this
+    marks nobody rather than guessing. Marking nobody is a genuinely
+    recoverable state (race_to_dict emits `player: null`, _race_is_final()
+    falls back to the all-players check, and the caller's
+    confirmed_local_name guard sees no mismatch to trip on); silently
+    attributing a stranger's result to the user is not. The previous
+    version reached this fallback whenever the salvage failed for any
+    reason, which is exactly how a 0-lap local timeout ended up logging a
+    different, already-DNF'd racer as "you"."""
     local_player = None
+    client_resolved = False
+    local_slot = None
+
+    # STATUS_RUN_COMPLETE_BIT (0x40) is deliberately NOT used for identity -- see
+    # that constant's docstring. It was briefly made the primary source on
+    # 2026-08-15 after it matched the local player in three offline/solo
+    # races, and a real 22-player online race immediately disproved it: the
+    # bit sat on `TiamaT` (slot 4, who WON the race) while the local player
+    # was `Ampp33` at slot 6, and CLIENT -- the mechanism it had been
+    # promoted over -- was correct. In every offline race the local player is
+    # the only human present, so a "not an AI"/host-ish flag is indistinguishable
+    # from "local player"; only a populated online lobby separates them.
+    # CLIENT is the identity source, as before.
     if module_base is not None and table_base is not None and slot0 is not None:
         local_slot = _local_player_slot_index(f, table_base, pid)
+        if local_slot is not None and not (0 <= local_slot < MAX_PLAYERS):
+            local_slot = None
+
+    if slot0 is not None:
         if local_slot is not None:
+            client_resolved = True
             for addr, p in pairs:
                 if (addr - slot0) // SLOT_STRIDE == local_slot:
                     local_player = p
                     break
             if local_player is None:
                 addr = slot0 + local_slot * SLOT_STRIDE
+                # The relaxed tier is gated on at least one OTHER racer
+                # having already validated this tick. Caught live 2026-08-15
+                # (game sitting in a menu, real slot data stale from a
+                # previous race): the local player's own slot alone can
+                # satisfy both occupancy proofs -- real name, plausible
+                # class rating -- while holding tt=0/bl=0 and a leftover
+                # odd lap counter, whose parity makes `finished` read True,
+                # so _race_is_final() fires and a phantom 1-row "race" gets
+                # logged straight out of an idle menu. That was a real
+                # regression this fix introduced and this gate closes it.
+                # It costs nothing against the bug actually being fixed:
+                # misattribution means labelling some OTHER racer as "you",
+                # which can only happen when other racers are present --
+                # and when `pairs` is empty the lowest-address fallback is
+                # already a no-op anyway, so there is nothing to protect
+                # against. Deliberate, documented limit: a SOLO race where
+                # the local player times out with 0 laps still won't
+                # salvage an entry -- there is no second racer to prove a
+                # race happened at all, and nothing worth logging there.
                 d = validate_entry(f, addr)
+                relaxed = False
+                if d is None and pairs:
+                    d = _validate_local_slot_relaxed(f, addr)
+                    relaxed = d is not None
                 if d is not None:
                     local_player = _read_player_native_only(f, d)
                     local_player.slot_index = local_slot
+                    # A relaxed salvage means this player has NO valid lap
+                    # time yet, so they cannot possibly have finished --
+                    # force `finished` False regardless of what the flag
+                    # bit says. Caught live 2026-08-15 in a 24-player
+                    # multiplayer race: without this, a relaxed-salvaged
+                    # local player one minute into the race (no lap set
+                    # yet, counter=1) carried `finished=True` purely
+                    # because counter 1 is ODD, so _race_is_final() fired
+                    # and logged a bogus mid-race "result" -- all 24 rows
+                    # sharing one identical total_time (the shared running
+                    # clock) and the local player with no lap time at all.
+                    # This is the parity bit being garbage (see
+                    # OFF_FINISHED_FLAG), but the relaxed tier is what
+                    # newly exposed the local player to it, so the tier
+                    # owns the guard. Costs nothing real: a player with no
+                    # completed lap has no finish to report either way.
+                    if relaxed:
+                        local_player.finished = False
                     pairs.append((addr, local_player))
     if local_player is None:
-        if not pairs:
+        if client_resolved or not pairs:
             return
         _, local_player = min(pairs, key=lambda pair: pair[0])
     local_player.is_local = True
@@ -739,8 +1079,43 @@ def _position_sort_key(p: PlayerResult) -> tuple:
     -- confirmed live this doesn't perfectly reproduce the real relative
     order of multiple same-lap-count DNFs, so treat sub-ordering among tied
     DNFs as best-effort, not verified, unlike the finished-vs-DNF split
-    itself.)"""
-    return (-p.laps_completed, p.total_time_ms)
+    itself.)
+
+    As of 2026-08-15 the finisher/DNF split no longer has to be INFERRED from
+    the lap counter at all: STATUS_DNF_BIT is the engine's own DNF flag (see
+    OFF_STATUS_FLAGS), verified across a 24-player online race where exactly
+    the 6 reported DNFs carried it and an offline race where all 24 did and
+    nobody finished. Sorting on it first makes every real finisher outrank
+    every DNF outright, which the lap counter only achieved indirectly (and
+    couldn't achieve at all for a DNF who died on the final lap with the same
+    counter value as a finisher). The lap counter stays as the next key, so
+    ordering among DNFs is unchanged and behaviour is identical whenever the
+    status field isn't populated (`dnf` reads False for everyone, and the key
+    degrades exactly to the previous one)."""
+    return (p.dnf, -p.laps_completed, p.total_time_ms)
+
+
+def _rank_players(players: list) -> list:
+    """Sorts a field into finishing order, preferring the engine's own
+    position byte (OFF_FINISH_POSITION) over any heuristic.
+
+    That byte is exact -- verified live against a full 24-car race's real
+    results screen, finishers and DNFs alike -- so when it looks coherent it
+    is used directly and nothing is inferred. "Coherent" means every player
+    has a non-zero value and no two share one: a partially-populated or
+    duplicated set (mid-race, stale slots, a mode that doesn't fill it)
+    would otherwise silently produce a garbage order, and a wrong order that
+    looks authoritative is worse than an approximate one that is honest
+    about being approximate.
+
+    Falls back to _position_sort_key()'s heuristic (DNF flag, then lap
+    count, then total time) whenever that check fails, which keeps the
+    previous behaviour exactly for any case the byte doesn't cover."""
+    positions = [p.finish_position for p in players]
+    usable = all(v > 0 for v in positions) and len(set(positions)) == len(positions)
+    if usable:
+        return sorted(players, key=lambda p: p.finish_position)
+    return sorted(players, key=_position_sort_key)
 
 
 def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
@@ -759,7 +1134,10 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 cached_pairs = []
                 seen_names: set = set()
                 for addr in cached_addrs:
-                    d = validate_entry(f, addr)
+                    # Second chance for a real racer the lap-time floors
+                    # reject -- anyone who DNF'd having completed 0 laps.
+                    # See _validate_any_slot_relaxed().
+                    d = validate_entry(f, addr) or _validate_any_slot_relaxed(f, addr)
                     if d is None:
                         continue
                     p = read_player(f, d, module_base, table_base)
@@ -772,9 +1150,9 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 # player's own slot has a bad player_ptr this tick would
                 # otherwise never get the salvage path a chance to run.
                 _mark_local_player(f, module_base, table_base, cached_pairs, slot0, pid)
+                _count_still_racing(f, slot0, pid)
                 if cached_pairs:
-                    cached_players = [p for _, p in cached_pairs]
-                    cached_players.sort(key=_position_sort_key)
+                    cached_players = _rank_players([p for _, p in cached_pairs])
                     for i, p in enumerate(cached_players):
                         p.position = i + 1
                     return cached_players, cached_addrs
@@ -798,7 +1176,9 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
         with _mem_and_bases(pid) as (f, module_base, table_base):
             slot0 = min(hits)
             for addr in hits:
-                d = validate_entry(f, addr)
+                # Second chance for a real racer the lap-time floors reject
+                # -- see the identical call in the cached branch above.
+                d = validate_entry(f, addr) or _validate_any_slot_relaxed(f, addr)
                 if d is None:
                     continue
                 p = read_player(f, d, module_base, table_base)
@@ -812,13 +1192,13 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
             # currently validates -- see the identical comment in the cached
             # branch above.
             _mark_local_player(f, module_base, table_base, pairs, slot0, pid)
+            _count_still_racing(f, slot0, pid)
             if not pairs:
                 return None, None
     except _PROC_ERRORS:
         return None, None
 
-    players_raw = [p for _, p in pairs]
-    players_raw.sort(key=_position_sort_key)
+    players_raw = _rank_players([p for _, p in pairs])
     for i, p in enumerate(players_raw):
         p.position = i + 1
     # Cache the FULL candidate slot list (`hits`), not just whichever ones
@@ -1775,20 +2155,30 @@ def read_tuning_for_race(pid: int, car_name: str) -> dict:
 
 
 # ── output ────────────────────────────────────────────────────────────────────
-def _race_results_table_str(race: RaceResult, width: int = 76) -> str:
+def _race_results_table_str(race: RaceResult, width: int = 82) -> str:
     """Plain-text results table -- header/rule/rows/closing rule, matching
     print_table()'s own table body exactly (factored out so it can also be
     reused for the API payload's `notes` field -- see _race_to_api_payload).
     Player names are already color-code-stripped at read time (see
-    _strip_color_codes()), so this comes out clean with no extra work here."""
+    _strip_color_codes()), so this comes out clean with no extra work here.
+
+    The trailing STATUS column carries "DNF" for any racer the engine flagged
+    as not finishing (STATUS_DNF_BIT -- see OFF_STATUS_FLAGS). Because this
+    same render is what gets posted as the API payload's `notes`, marking it
+    here is what puts DNF status into the posted comment, not just the
+    console. Rows stay in ranked order either way: DNFs are sorted below
+    every finisher by _position_sort_key() and keep their real position
+    number, so the column annotates the ranking rather than replacing it.
+    Width widened from 76 to fit the extra column."""
     lines = [
-        f"  {'POS':<4} {'NAME':<20} {'CAR':<18} {'CLASS':<7} {'BEST LAP':<11} TOTAL",
+        f"  {'POS':<4} {'NAME':<20} {'CAR':<18} {'CLASS':<7} {'BEST LAP':<11} {'TOTAL':<11} STATUS",
         f"  {'-' * (width - 2)}",
     ]
     for p in race.players:
         name = f"{p.name} (you)" if p.is_local else p.name
         lines.append(f"  {p.position:<4} {name:<20} {p.car:<18} {p.class_str():<7} "
-                      f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms)}")
+                      f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms):<11} "
+                      f"{'DNF' if p.dnf else ''}".rstrip())
     lines.append("=" * width)
     return "\n".join(lines)
 
@@ -1797,7 +2187,7 @@ def print_table(race: RaceResult):
     loc = race.track
     if race.variation:
         loc += f" — {race.variation}"
-    W = 76
+    W = 82   # matches _race_results_table_str()'s default -- STATUS column
     print()
     print("=" * W)
     print(f"  RACE RESULTS  {loc}")
@@ -1822,6 +2212,17 @@ def _player_to_dict(p: PlayerResult) -> dict:
         "total_time":    ms_to_str(p.total_time_ms),
         "lap_times_ms":  p.lap_times_ms,
         "lap_times":     [ms_to_str(t) for t in p.lap_times_ms],
+        # Engine's own DNF flag (STATUS_DNF_BIT) -- not inferred from times.
+        # Every racer is in this payload now, including those who completed
+        # zero laps, so without this a DNF is indistinguishable from a
+        # finisher who simply has no lap time recorded.
+        "dnf":           p.dnf,
+        # Real laps completed. PlayerResult.laps_completed holds the engine's
+        # CURRENT LAP NUMBER, which is 1-indexed and therefore one higher --
+        # verified live (a 2-lap race freezes it at 3, a 3-lap race at 4, and
+        # it resets to 1 pre-race). Corrected here so consumers get the
+        # actual count rather than the raw internal value.
+        "laps_completed": max(0, p.laps_completed - 1),
     }
 
 
@@ -1953,9 +2354,15 @@ def post_race_result(config: dict, race: RaceResult, timeout: float = 10.0) -> b
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
-def _race_is_final(players: list) -> bool:
-    """True once the LOCAL player's own OFF_FINISHED_FLAG bit is set -- see
-    the comment there for how the signal itself was found and verified live.
+def _race_is_final(players: list, pid: Optional[int] = None) -> bool:
+    """True once the RESULTS SCREEN has been reached -- every real racer's
+    status carries a terminal marker and nobody is still circulating. See the
+    inline comment below for the two earlier, weaker signals this replaced
+    and why each fired too early.
+
+    The historical note that follows describes the ORIGINAL all-players
+    check, kept because the failure it documents is still the reason the
+    fallback path at the bottom is local-scoped rather than field-scoped.
     Deliberately checks only the local player, not every tracked racer (an
     earlier version required all(p.finished for p in players)) -- confirmed
     live 2026-08-08 in a real 24-player public lobby that requiring every
@@ -1971,8 +2378,56 @@ def _race_is_final(players: list) -> bool:
     player can't be identified at all (should be rare -- _mark_local_player()
     already has its own salvage path for a bad player_ptr specifically)."""
     local = next((p for p in players if p.is_local), None)
+
+    # PRIMARY: the engine's own status field. STATUS_RUN_COMPLETE_BIT appears on the
+    # local player's slot exactly when their result finalizes -- verified live
+    # twice: in a 24-player online race it flipped 0->65 at the same instant
+    # the local player crossed the line, and in an offline race where NOBODY
+    # finished it appeared as results populated. That "nobody finished" case
+    # is why this can't key off reaching a lap target: a race where everyone
+    # DNFs is a perfectly normal outcome.
+    #
+    # This replaces FINISHED_BIT as the primary signal because FINISHED_BIT is
+    # not a finish signal at all -- it is the low bit of the lap counter (see
+    # OFF_FINISHED_FLAG), so it reads "finished" or "not finished" purely on
+    # whether the counter happens to be odd. Confirmed live, twice: two
+    # separate 3-lap races ended with every finisher frozen at counter=4
+    # (even), so nothing was ever logged -- i.e. ANY race with an odd lap
+    # count silently never logged at all.
+    # PRIMARY: the RESULTS SCREEN -- every real racer's status has a terminal
+    # marker (0x40 "run complete" or STATUS_DNF_BIT) and nobody is still
+    # circulating. This is what the user asked for explicitly (2026-08-16):
+    # capture whatever the results screen shows, players departed or not.
+    #
+    # Two weaker signals were tried first and both are wrong:
+    #   - "ANY player has 0x40" fires when the LEADER crosses the line, which
+    #     snapshots a mid-race field while the local player may still be laps
+    #     from home. Confirmed live: seven slots carried 0x40 at once while
+    #     the race ran on.
+    #   - "the LOCAL player's own run is over" is better but still early: it
+    #     fires the moment the local player finishes, capturing every other
+    #     racer mid-race. Their rows -- and the API `notes` roster built from
+    #     them -- are then not final results.
+    #
+    # `_STILL_RACING_COUNT` is what makes this reliable; see its comment for
+    # why the returned player list alone cannot answer "is anyone still out
+    # there". A departed racer simply leaves the slot array, so quitters
+    # can't hold this open -- which is the behaviour the user wants, even
+    # though it means positions may have renumbered around the departure.
+    still_racing = _STILL_RACING_COUNT.get(pid) if pid is not None else None
+    everyone_settled = all(p.status_flags & (STATUS_RUN_COMPLETE_BIT | STATUS_DNF_BIT)
+                           for p in players)
+    if players and everyone_settled and still_racing == 0:
+        return True
+
+    # FALLBACK: the old parity check, kept only for a mode where the status
+    # field somehow never populates (none seen -- solo, offline AI and online
+    # multiplayer were all verified to set it). Hardened with a completed-lap
+    # requirement: without it, a local player with no lap time yet and an odd
+    # counter reads "finished" one minute into a race, which is exactly how a
+    # bogus mid-race result got logged in a 24-player lobby on 2026-08-15.
     if local is not None:
-        return local.finished
+        return local.finished and MIN_LAP_MS <= local.best_lap_ms <= MAX_LAP_MS
     return all(p.finished for p in players)
 
 
@@ -2102,7 +2557,7 @@ def main():
                 else:
                     fingerprint = tuple((p.name, p.total_time_ms) for p in players)
                 is_stable = fingerprint == last_fingerprint_seen
-                if (_race_is_final(players) and is_stable
+                if (_race_is_final(players, pid) and is_stable
                         and fingerprint != last_logged_fingerprint):
                     if args.debug and cached_addrs:
                         print(f"[debug] cluster base = 0x{min(cached_addrs):016x}  ({len(cached_addrs)} slots)")
