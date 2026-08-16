@@ -2262,6 +2262,22 @@ def _race_is_final(players: list, pid: Optional[int] = None) -> bool:
     # can't hold this open -- which is the behaviour the user wants, even
     # though it means positions may have renumbered around the departure.
     still_racing = _STILL_RACING_COUNT.get(pid) if pid is not None else None
+
+    # HARD VETO, checked before anything else: if any real racer still lacks a
+    # terminal classification, the race is not over -- whatever other signals
+    # say. Caught live 2026-08-16: PAUSING an offline race logged a result.
+    # The trace showed why exactly -- mid-race offline NO racer has status
+    # bits yet, so `any(p.status_flags ...)` was False, the gate below did not
+    # block, and control reached the parity fallback, which read "finished"
+    # purely because the local player's lap counter had just ticked to an ODD
+    # value; pausing then froze the clock, satisfying main()'s stability
+    # check, and it logged. `_STILL_RACING_COUNT` was reporting 1 the whole
+    # time -- the one signal with the right answer was never consulted,
+    # because it was only read inside the classified-bit branch, which cannot
+    # fire when no status data exists at all.
+    if still_racing:
+        return False
+
     everyone_settled = all(p.status_flags & STATUS_CLASSIFIED_BIT for p in players)
     if players and everyone_settled and still_racing == 0:
         return True

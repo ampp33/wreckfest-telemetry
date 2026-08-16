@@ -79,6 +79,25 @@ Tools exposed:
 
 _Newest first. Add an entry whenever something breaks, gets fixed, or a new quirk is discovered._
 
+- **2026-08-16 — user-reported bug FIXED: PAUSING an offline race logged a result. Root cause caught live on the exact transition, not inferred.**
+
+  **The trace** (a `pause_probe.py` printing `_race_is_final()`'s decision inputs on every change) captured it cleanly:
+  ```
+  17:02:38  laps 1->2  parity False->True  final False->True   <- lap counter ticked ODD
+  17:02:39  clock frozen at 34240, stable=True                 <- the pause
+            -> WOULD LOG
+  ```
+
+  **Mechanism**: offline mid-race, **no racer has status bits yet**, so `any(p.status_flags ...)` was False, the gate added earlier did not block, and control reached the legacy parity fallback. That returned True purely because the local player's lap counter had just become **odd**. Pausing froze the clock, which satisfied `main()`'s stability check, and the race logged.
+
+  **The damning detail**: `_STILL_RACING_COUNT` was reporting **1** the entire time -- it knew perfectly well the local player was still circulating. It was simply never consulted, because it was only read inside the classified-bit branch, and that branch cannot fire when there is no status data at all. The signal with the right answer was structurally unreachable in the situation that needed it.
+
+  **Fix**: `still_racing` is now a **hard veto at the top of `_race_is_final()`** -- if any real racer lacks a terminal classification, the race is not over, whatever any other signal says. This subsumes the earlier gate rather than adding another special case, and it is the third and final restriction on the parity fallback (first ungated, then gated on "no status data", now also vetoed by still-racing).
+
+  **Verified**: against the user's live paused race (`still_racing=1` -> `final=False`), plus targeted synthetic cases -- paused mid-race with odd parity and a frozen clock -> False; genuine results with everyone classified -> True; one straggler still circulating -> False. Full suite passes.
+
+  **Pattern worth noting**: this is the third time the parity fallback has caused a false log, each in a situation its previous guard did not anticipate. The lesson is not "add another guard" but that a fallback able to *override* a working primary signal keeps finding new ways to do so. If a future session finds a fourth, delete it outright rather than gate it again -- every mode observed so far populates the status field.
+
 - **2026-08-16 — SECOND consecutive clean run, independently confirming the DNF/non-finisher split.** Rattlesnake Racepark, 21 racers: user reported **6th, 9 DNF, 4 non-finishers**; the tool logged **P6, 9 flagged DNF, and exactly 4 classified-but-short racers** (`bertran77`, `Bluewhale`, `MacGyver`, `terrible racer 24`, all sharing the `06:08.448` time-limit stamp). A larger non-finisher sample than the previous race's two, reached with no corrections and no code changes in between.
 
 - **2026-08-16 — CLEAN RUN, and it resolves what `STATUS_DNF_BIT` actually means. Also: the local player was finally observed at a NON-ZERO slot in a live online race, closing the last untested identity gap.**
