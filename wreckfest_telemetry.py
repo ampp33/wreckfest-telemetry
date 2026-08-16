@@ -214,18 +214,6 @@ class PlayerResult:
         reads False mid-race, which is the correct answer then anyway."""
         return bool(self.status_flags & STATUS_DNF_BIT)
 
-    @property
-    def run_complete(self) -> bool:
-        """True if the engine flagged this exact slot as the local player.
-        Appears only once results finalize (see OFF_STATUS_FLAGS), which is
-        why _race_is_final() can use its presence as the finality edge.
-
-        Deliberately NOT inferring finality from any other bit: bit 0x01 is
-        set on every terminal value but was observed flickering 0->1->0
-        mid-race (20 and 7 transitions in one race), so only the two bits
-        that have actually been verified stable are trusted here."""
-        return bool(self.status_flags & STATUS_RUN_COMPLETE_BIT)
-
     def __eq__(self, other):
         return (isinstance(other, PlayerResult)
                 and self.name == other.name
@@ -686,7 +674,8 @@ def _validate_any_slot_relaxed(f, addr: int) -> Optional[dict]:
     occupancy proof than name-plus-class-rating alone, and it is what makes
     widening the net safe here: an empty seat never gets a terminal status,
     and stale mid-race slots read 0 or 4 (bit 0x01 flickers mid-race and is
-    deliberately NOT accepted as a marker -- see PlayerResult.run_complete).
+    deliberately NOT accepted as a marker -- only STATUS_DNF_BIT and
+    STATUS_RUN_COMPLETE_BIT are trusted).
 
     Note this admits a player who DNFs *mid-race* as soon as the engine flags
     them, which is correct: they are genuinely out, and their result is
@@ -1622,8 +1611,9 @@ def _read_tuning_widgets(pid: int) -> dict:
     (including GEARING, which an earlier session had believed this couldn't
     track) and confirmed to follow a real live change correctly. The
     2026-08-06 "loadout array" source that briefly superseded this was found
-    the same day to be unreliable -- see the DEMOTED note in the loadout
-    array section below -- and is no longer used as a live source."""
+    the same day to be unreliable, and has since been deleted outright (see
+    PROJECT.md 2026-08-14 for the demotion and 2026-08-16 for its removal as
+    dead code). This is the sole live source."""
     result = {}
     try:
         with _mem_and_bases(pid) as (f, _, table_base):
@@ -1667,8 +1657,8 @@ def read_tuning(pid: int) -> dict:
     guessed -- there is no reliable live source for that case (the
     equipped-part loadout array once used to cover this gap was found the
     same day to sometimes return a *wrong* value, not just a missing one,
-    which is worse than omitting it -- see the DEMOTED note above
-    _read_loadout_tuning's section)."""
+    which is worse than omitting it; that code has since been removed as
+    dead -- see PROJECT.md 2026-08-14 and 2026-08-16)."""
     return _read_tuning_widgets(pid)
 
 
@@ -1871,217 +1861,6 @@ def _match_cars5_codename(car_name: str, display_names: dict) -> Optional[str]:
     return next((c for c, n in display_names.items() if n == car_name), None)
 
 
-# ── car tuning, live (equipped-part loadout array) ───────────────────────────
-# DEMOTED 2026-08-14 -- do not use as a live tuning source. Confirmed live,
-# repeatedly, in a real online race: _find_loadout_array()'s "first
-# structurally-valid hit" scan lands on a *different car's* record between
-# calls with no code change (non-deterministic depending on scan timing/heap
-# state), and can silently return an outright WRONG value for a category
-# rather than an empty one -- caught directly: reported GEARING=3 while the
-# on-screen/ground-truth value (cross-checked against _read_tuning_widgets(),
-# itself verified live to track a real SUSPENSION change 4->3 correctly) was
-# GEARING=2. Root cause: the ~4MB region this scans isn't a per-player "my
-# currently equipped parts" array at all -- a full scan turned up 787
-# category-matching records spanning nearly every car in the game's entire
-# roster (01-16 across every class, including cars nobody in the race was
-# driving), i.e. a shared reference/preset pool, not live per-player state.
-# _read_tuning_widgets() (below) is the correct, verified live source now.
-#
-# Original (superseded) rationale, kept for context: a small (~4MB) rw heap
-# region holds a fixed-stride (0x120-byte) array of "currently equipped
-# part" records, one per part slot (gearbox/transmission/suspension/
-# brakes/tires/...), each holding a live resource-path string. Confirmed
-# live 2026-08-06: watched one record's tail flip soft -> msoft -> hard in
-# real time as SUSPENSION was dragged on-screen, with no save or backing out
-# in between -- a genuine live value, just not reliably *this session's
-# actual player's* record once the wrong-car problem above was found.
-#
-# This array is easy to confuse with a much bigger (~50MB+) bump-allocator
-# arena elsewhere in the process that holds a *history* of past save-buffer
-# strings (thousands of stale duplicate paths, one batch per actual disk
-# write -- see machine_code_career/PROJECT.md part 18). Both contain the
-# same kind of path string, so content alone doesn't distinguish them;
-# what does is structure: this array's records sit exactly _LOADOUT_STRIDE
-# apart with a sequential per-record id, and the whole array lives in a
-# region far smaller than the historical arena -- filtering candidate
-# regions by size (skip anything past _LOADOUT_MAX_REGION_BYTES) turned out
-# to be a clean, address-independent way to skip the arena outright rather
-# than relying on today's specific addresses.
-#
-# Record layout (relative to record base, little-endian):
-#   +0x00..0x1E  unknown (pointer/tag-shaped fields, not needed)
-#   +0x1F        sequential slot id (uint8) -- adjacent records in the
-#                array differ by exactly 1; used only to validate a
-#                candidate base is really part of this array, not the
-#                differently-strided historical arena
-#   +0x23        NUL-terminated ASCII path, e.g.
-#                "data/vehicle/<codename>/part/<category>/<preset>.<ext>"
-#                -- decoded with the same _CARS5_PART_PATH_RE/
-#                CARS5_TUNE_PRESETS used for the save file, above.
-_LOADOUT_STRIDE            = 0x120
-_LOADOUT_ID_OFF             = 0x1F
-_LOADOUT_STR_OFF            = 0x23
-_LOADOUT_MAX_REGION_BYTES   = 20 * 1024 * 1024  # observed target region ~4MB; historical arena ~50MB+
-
-_loadout_array_cache: dict = {}  # pid -> one confirmed record base (any slot)
-
-
-def _loadout_id(f, addr: int) -> Optional[int]:
-    d = _rd(f, addr + _LOADOUT_ID_OFF, 1)
-    return d[0] if d else None
-
-
-def _loadout_path(f, addr: int) -> Optional[bytes]:
-    d = _rd(f, addr + _LOADOUT_STR_OFF, 128)
-    if not d:
-        return None
-    end = d.find(b'\x00')
-    return d[:end] if end != -1 else d
-
-
-def _loadout_record_ok(f, addr: int) -> bool:
-    """Cheap check used while walking an already-trusted array -- just
-    "does this look like one of our records", no neighbor cross-check."""
-    path = _loadout_path(f, addr)
-    return bool(path) and path.startswith(b"data/vehicle/") and b"/part/" in path
-
-
-def _loadout_base_has_categories(f, addr: int, min_categories: int = 2) -> bool:
-    """Walks a bounded window around `addr` and checks it actually contains
-    at least `min_categories` distinct real tuning categories (gearbox/
-    transmission/suspension/brakes) before trusting it as *the* live
-    per-car array. Needed because the stride+sequential-id shape alone
-    isn't unique -- confirmed live 2026-08-06 that another, differently-
-    populated region can pass the plain structural check (same stride,
-    same id-adjacency pattern) without actually holding any of our 4
-    categories, silently producing an empty read (see PROJECT.md)."""
-    seen = set()
-    for base in _walk_loadout_array(f, addr, max_span=20):
-        path = _loadout_path(f, base)
-        if not path:
-            continue
-        m = _CARS5_PART_PATH_RE.search(path)
-        if m:
-            seen.add(m.group(2))
-        if len(seen) >= min_categories:
-            return True
-    return False
-
-
-def _validate_loadout_base(f, addr: int) -> bool:
-    """Stricter check used only when trusting a brand-new candidate base
-    found by raw content search -- requires both a real neighbor exactly
-    _LOADOUT_STRIDE away whose id differs by 1 (rules out the historical
-    arena's differently-shaped/strided entries), AND actual tuning-category
-    content nearby (rules out other same-shaped-but-wrong arrays)."""
-    if not _loadout_record_ok(f, addr):
-        return False
-    sid = _loadout_id(f, addr)
-    if sid is None:
-        return False
-    nxt = _loadout_id(f, addr + _LOADOUT_STRIDE)
-    prv = _loadout_id(f, addr - _LOADOUT_STRIDE)
-    if not ((nxt is not None and nxt == (sid + 1) % 256) or
-            (prv is not None and prv == (sid - 1) % 256)):
-        return False
-    return _loadout_base_has_categories(f, addr)
-
-
-def _find_loadout_array(f, pid: int) -> Optional[int]:
-    """Locates one confirmed record base of the live loadout array, cached
-    per-pid thereafter. Scans writable regions smaller than
-    _LOADOUT_MAX_REGION_BYTES (skipping the huge historical arena outright)
-    for the b"data/vehicle/" anchor, validating each hit structurally
-    before trusting it."""
-    cached = _loadout_array_cache.get(pid)
-    if cached is not None and _loadout_base_has_categories(f, cached):
-        return cached
-    needle = b"data/vehicle/"
-    CHUNK = 4 * 1024 * 1024
-    for start, end in _writable_regions(pid):
-        if end - start > _LOADOUT_MAX_REGION_BYTES:
-            continue
-        offset = start
-        remaining = end - start
-        overlap = b""
-        while remaining > 0:
-            n = min(CHUNK, remaining)
-            f.seek(offset)
-            buf = f.read(n)
-            if not buf:
-                break
-            hay = overlap + buf
-            hay_base = offset - len(overlap)
-            pos = 0
-            while True:
-                idx = hay.find(needle, pos)
-                if idx == -1:
-                    break
-                hit_addr = hay_base + idx
-                pos = idx + 1
-                base = hit_addr - _LOADOUT_STR_OFF
-                if _validate_loadout_base(f, base):
-                    _loadout_array_cache[pid] = base
-                    return base
-            overlap = buf[-(len(needle) - 1):]
-            offset += len(buf)
-            remaining -= len(buf)
-    return None
-
-
-def _walk_loadout_array(f, anchor: int, max_span: int = 40) -> list:
-    """All record bases reachable from `anchor` by walking +-_LOADOUT_STRIDE,
-    for up to max_span steps each direction. Deliberately does NOT stop at
-    the first record whose path doesn't parse as a part path (e.g. an
-    engine sub-part slot with no current selection has a differently-
-    shaped record at the same stride) -- confirmed live 2026-08-06 that
-    such records sit *in the middle* of an otherwise-valid run, and
-    stopping there silently truncated the walk before it ever reached
-    GEARING/DIFFERENTIAL/SUSPENSION/BRAKES. Only stops early if the
-    memory itself becomes unreadable (walked off the end of the array)."""
-    bases = [anchor]
-    base = anchor
-    for _ in range(max_span):
-        nxt = base + _LOADOUT_STRIDE
-        if _loadout_id(f, nxt) is None:
-            break
-        bases.append(nxt)
-        base = nxt
-    base = anchor
-    for _ in range(max_span):
-        prv = base - _LOADOUT_STRIDE
-        if _loadout_id(f, prv) is None:
-            break
-        bases.append(prv)
-        base = prv
-    return bases
-
-
-def _read_loadout_tuning(pid: int) -> dict:
-    """Current 0-4 index per tuning category, read from the live equipped-
-    part loadout array (see section docstring above). Fail-quiet, same
-    contract as read_tuning_from_save(): {} on any failure."""
-    result: dict = {}
-    try:
-        with _mem_and_bases(pid) as (f, _, _):
-            anchor = _find_loadout_array(f, pid)
-            if anchor is None:
-                return result
-            for base in _walk_loadout_array(f, anchor):
-                path = _loadout_path(f, base)
-                if not path:
-                    continue
-                m = _CARS5_PART_PATH_RE.search(path)
-                if not m:
-                    continue
-                key, preset = m.group(2).decode(), m.group(3).decode()
-                label, presets = CARS5_TUNE_PRESETS[key]
-                if preset in presets:
-                    result[label] = presets.index(preset)
-    except _MEM_ERRORS:
-        return result
-    return result
-
 
 def read_tuning_from_save(car_name: str) -> dict:
     """Current 0-4 index per tuning category for the owned car whose display
@@ -2138,9 +1917,9 @@ def read_tuning_for_race(pid: int, car_name: str) -> dict:
     The live widget read doesn't have this lag (it reflects the slider
     immediately, no save required), so it's used first here. An earlier
     version of this function used a different live source (the equipped-
-    part "loadout array") that turned out to be actively unreliable -- see
-    the DEMOTED note in that section -- so it has been dropped from this
-    priority chain entirely rather than merged in as a second opinion.
+    part "loadout array") that turned out to be actively unreliable, so it
+    was dropped from this priority chain entirely rather than merged in as a
+    second opinion, and the code has since been deleted as dead.
     Falls back to the save file per-category both for tabs not visited this
     session AND because the save file is keyed by the *race's own* car
     name, robust to the player having already moved on to tuning a
@@ -2567,8 +2346,8 @@ def main():
                     resolve_car_names(pid, players)
                     track, variation = detect_track_and_variation(pid)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    # Tuning to attach to this race -- live loadout array
-                    # first, save-file fallback per category. See
+                    # Tuning to attach to this race -- live slider-widget
+                    # read first, save-file fallback per category. See
                     # read_tuning_for_race()'s docstring for why: the save
                     # file alone can lag a real, already-raced tuning change
                     # until the Tune screen is backed out of. Needs the local

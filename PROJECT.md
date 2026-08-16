@@ -79,6 +79,18 @@ Tools exposed:
 
 _Newest first. Add an entry whenever something breaks, gets fixed, or a new quirk is discovered._
 
+- **2026-08-16 — dead-code removal: the entire equipped-part "loadout array" tuning subsystem deleted (~220 lines), plus a misleading bit name renamed. Net -233 lines.**
+
+  **Removed: the loadout-array cluster** (`_LOADOUT_*` constants, `_loadout_array_cache`, `_loadout_id`, `_loadout_path`, `_loadout_record_ok`, `_loadout_base_has_categories`, `_validate_loadout_base`, `_find_loadout_array`, `_walk_loadout_array`, `_read_loadout_tuning`). This was demoted on 2026-08-14 after being caught returning a *wrong* value live rather than merely a missing one, and `read_tuning()` has been `return _read_tuning_widgets(pid)` ever since -- so the whole subsystem had been unreachable for two days while still carrying its full discovery narrative. The reverse-engineering story it documented is preserved in this file (2026-08-06 entries) and in git history; keeping ~220 lines of unreachable code as documentation was the wrong trade.
+    - Verified after removal against the live game: `read_tuning_for_race()` and `read_tuning_from_save()` both still return the correct 4 categories. (`read_tuning()` returning `{}` in that check is expected, not a regression -- the Tune screen hadn't been visited that session, which is exactly the documented "omit rather than guess" behaviour.)
+    - Four docstrings/comments that pointed at the deleted section were rewritten rather than left dangling.
+
+  **Renamed `STATUS_LOCAL_BIT` -> `STATUS_RUN_COMPLETE_BIT`** and dropped the unused `PlayerResult.run_complete` property. The old name asserted exactly the thing that was disproved hours earlier, and a name that contradicts the evidence is how the original misattribution happened in the first place -- leaving it in place was an invitation to re-derive the same bug.
+
+  **How the audit was done** (worth repeating, and worth knowing the traps): an AST pass listing module-level names never *loaded*, plus a call-graph reachability walk from `main()`. Both need manual confirmation -- the first version counted assignment targets as uses, so no constant could ever be flagged; and reachability alone falsely accuses properties (`p.dnf`), functions passed by reference (`key=_position_sort_key`), dict-comprehension helpers (`_snake`), and dunders. Every candidate was grepped individually before deletion.
+
+  **Deliberately KEPT despite being unreferenced in code**: `OFF_LAP_COUNTER` and `OFF_FINISH_POSITION`. Both document where a byte lives inside the `addr-32` word, but the code reads that word once and extracts bytes by shifting, so neither constant can appear in an expression. They are load-bearing *documentation* of the memory layout in a file whose entire purpose is recording such layouts -- deleting them would remove the only statement of where those bytes are.
+
 - **2026-08-16 — capture point changed, on explicit user instruction, to THE RESULTS SCREEN: "I just want the results AT RESULTS TIME, whatever that is, players gone or not."** This supersedes the trade-off recorded in the entry below, which had settled for logging at the local player's own finish and accepted that other racers were captured mid-race.
 
   **The signal**: every real racer's status field carries a terminal marker (`0x40` "run complete" or `STATUS_DNF_BIT`) **and** nobody is still circulating. Grounded in captured live data -- at the results screen every racer had a terminal marker, while mid-race several sat at `0x00`.
