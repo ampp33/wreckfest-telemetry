@@ -123,6 +123,22 @@ OFF_LAP_COUNTER    = -31
 # only correlates with progress while a car is actually moving (a wrecked
 # car crawling for 90s can outlast the field while placing dead last).
 OFF_FINISH_POSITION = -32   # byte 0 of the OFF_FINISHED_FLAG word
+#   STATUS_CLASSIFIED_BIT (0x01) -- "this racer's result is classified", i.e.
+#     they are done, by finishing, by running out of time, or by DNF. This is
+#     the real settled/not-settled discriminator and the basis of results-time
+#     detection. Every terminal status value observed across a full night of
+#     live races is ODD (0x01, 0x13, 0x17, 0x41, 0x45, 0x53, 0x57) and every
+#     mid-race one is EVEN (0x00, 0x04).
+#     It was initially dismissed as unusable because it was seen flickering
+#     0->1->0 mid-race, and STATUS_RUN_COMPLETE_BIT was built on instead --
+#     which had it backwards: 0x40 is the unreliable one. Caught live
+#     2026-08-16 in a 12-racer online race where, AT the results screen, ten
+#     finishers sat at plain 0x01 and only the local player had 0x40, so a
+#     0x40-based check never fired and the race never logged.
+#     The mid-race flicker is guarded by requiring it of EVERY racer at once
+#     plus main()'s existing clock-stability check, not by trusting one
+#     player's bit in isolation.
+STATUS_CLASSIFIED_BIT = 0x01
 OFF_STATUS_FLAGS  = -36
 STATUS_RUN_COMPLETE_BIT  = 0x40
 STATUS_DNF_BIT    = 0x10
@@ -731,7 +747,7 @@ def _count_still_racing(f, slot0: int, pid: Optional[int]) -> None:
     for i in range(MAX_PLAYERS):
         addr = slot0 + i * SLOT_STRIDE
         st = ri32(f, addr + OFF_STATUS_FLAGS)
-        if st is None or (st & (STATUS_RUN_COMPLETE_BIT | STATUS_DNF_BIT)):
+        if st is None or (st & STATUS_CLASSIFIED_BIT):
             continue
         rating = ri32(f, addr + OFF_CLASS_RATING)
         if rating is None or not (50 <= rating <= 600):
@@ -932,7 +948,31 @@ def _find_car_name_table(pid: int, local_slot: int, local_car_name: str) -> Opti
     entry -- content match at the one position we can already verify,
     not just structural shape alone."""
     regions = anon_writable_regions(pid)
-    hits = []
+    target = local_car_name.upper()
+
+    # Search order + early exit. Measured live 2026-08-16 on a real session:
+    # 285 anonymous writable regions totalling ~1.7 GB, and in plain ascending
+    # address order the table sat 68% of the way through -- so this scanned
+    # ~1.2 GB before reaching it and then kept going over the remaining ~0.5 GB
+    # because there was no early exit. ~4.8 s.
+    #
+    # The table lives just above the executable image (found at 0x1419fae50
+    # with module_base 0x140000000), so sorting regions at/above module_base
+    # first puts its region FIRST -- 0 bytes scanned before it in the measured
+    # session, versus 1163 MB. Combined with validating per region and
+    # returning on the first content-confirmed run, the common case now reads
+    # one ~160 MB region instead of 1.7 GB.
+    #
+    # Purely an ordering + stop-early change: if the guess is wrong, every
+    # region still gets scanned and the result is identical, just as slow as
+    # before. The acceptance test is unchanged and content-based (the local
+    # player's own already-trusted car name must appear at `local_slot`), so
+    # reordering cannot make a wrong table win -- it only changes which
+    # region is *tried* first, never what counts as a match.
+    module_base = find_module_base(pid) or 0
+    regions = ([r for r in regions if r[0] >= module_base]
+               + [r for r in regions if r[0] < module_base])
+
     CHUNK = 8 * 1024 * 1024
     overlap = 24  # >= longest possible token, so a match split across a chunk boundary is never missed
     try:
@@ -945,6 +985,7 @@ def _find_car_name_table(pid: int, local_slot: int, local_car_name: str) -> Opti
                 except OSError:
                     continue
                 prev_tail = b""
+                hits: list = []
                 while offset < size:
                     n = min(CHUNK, size - offset)
                     try:
@@ -959,21 +1000,15 @@ def _find_car_name_table(pid: int, local_slot: int, local_car_name: str) -> Opti
                         hits.append(hay_base + m.start())
                     prev_tail = chunk[-overlap:]
                     offset += len(chunk)
-    except _PROC_ERRORS:
-        return None
 
-    runs = _stride_runs(hits, _CAR_NAME_TABLE_STRIDE)
-    if not runs:
-        return None
-
-    target = local_car_name.upper()
-    try:
-        with open(f"/proc/{pid}/mem", "rb") as f:
-            for run in runs:
-                if local_slot >= len(run):
-                    continue
-                if rcstr(f, run[local_slot], 32).upper() == target:
-                    return run[0]
+                # Validate this region's runs before moving on -- a run is
+                # contiguous within one region, so per-region clustering finds
+                # exactly what a whole-process pass would.
+                for run in _stride_runs(hits, _CAR_NAME_TABLE_STRIDE):
+                    if local_slot >= len(run):
+                        continue
+                    if rcstr(f, run[local_slot], 32).upper() == target:
+                        return run[0]
     except _PROC_ERRORS:
         return None
     return None
@@ -1926,6 +1961,39 @@ def read_tuning_for_race(pid: int, car_name: str) -> dict:
     different car in the garage by the time this race's result is
     processed."""
     live = _read_tuning_widgets(pid)
+    # A live reading of 0 is AMBIGUOUS and is not trusted over the save file.
+    # Caught live 2026-08-16, user-confirmed: in a fresh game session where
+    # the Tune screen had never been opened, all four slider widgets still
+    # resolved through the registry and read a normalized value of 0.0 ->
+    # index 0. That is indistinguishable from a slider genuinely parked at
+    # index 0, so the live source confidently reported
+    # GEARING/DIFF/SUSPENSION/BRAKES = 0,0,0,0 and overrode a save file
+    # correctly holding 2,4,4,1 -- and a real race was logged with tuning
+    # that was simply wrong. `_read_tuning_widgets()` omits a category whose
+    # widget can't be resolved, but an *uninitialised* widget resolves fine;
+    # "resolves" was never the same thing as "this tab was visited".
+    #
+    # Only the ALL-ZERO reading is treated as uninitialised, not every
+    # individual zero. If the Tune screen really was open, the other
+    # categories read their own real values, so a MIX like
+    # {SUSPENSION: 0, GEARING: 2, ...} is a genuine reading that happens to
+    # include a slider parked at 0 -- discarding that would throw away a
+    # correct live value. All four reading 0 at once is the uninitialised
+    # signature.
+    #
+    # Deferring is safe in both directions, because index 0 is genuinely
+    # PERSISTED in cars5.ccrs -- verified directly against the user's own
+    # save: 14 records across 58 cars sit at index 0 (e.g. supervan
+    # BRAKES=rear, harvester GEARING=eshort). So a player whose tuning really
+    # is all zeros gets 0 back from the save file anyway; nothing is lost.
+    #
+    # The single case this gives up: all four sliders moved to 0 in this
+    # session and raced before the game rewrote cars5.ccrs. That degrades to
+    # a slightly stale value rather than a confidently wrong one -- the same
+    # principle that got the loadout array demoted, where a live source
+    # returning a WRONG value is worse than one returning no value.
+    if live and all(v == 0 for v in live.values()):
+        live = {}
     if len(live) == len(TUNE_CATEGORIES):
         return live
     result = read_tuning_from_save(car_name)
@@ -2194,8 +2262,7 @@ def _race_is_final(players: list, pid: Optional[int] = None) -> bool:
     # can't hold this open -- which is the behaviour the user wants, even
     # though it means positions may have renumbered around the departure.
     still_racing = _STILL_RACING_COUNT.get(pid) if pid is not None else None
-    everyone_settled = all(p.status_flags & (STATUS_RUN_COMPLETE_BIT | STATUS_DNF_BIT)
-                           for p in players)
+    everyone_settled = all(p.status_flags & STATUS_CLASSIFIED_BIT for p in players)
     if players and everyone_settled and still_racing == 0:
         return True
 
@@ -2205,6 +2272,20 @@ def _race_is_final(players: list, pid: Optional[int] = None) -> bool:
     # requirement: without it, a local player with no lap time yet and an odd
     # counter reads "finished" one minute into a race, which is exactly how a
     # bogus mid-race result got logged in a 24-player lobby on 2026-08-15.
+    # FALLBACK, deliberately almost unreachable: only when the status field
+    # is entirely unpopulated for EVERY racer, i.e. a mode that doesn't use
+    # it at all. If any racer has status bits, the check above is the
+    # authority and its answer -- including "not yet" -- must stand.
+    #
+    # This gate exists because the ungated version fired live 2026-08-16 and
+    # logged a mid-race snapshot: `_STILL_RACING_COUNT` correctly reported 8
+    # racers still circulating, the results-time check correctly returned
+    # False, and then control fell through to the parity test, which was True
+    # purely because the local player's lap counter happened to be ODD and
+    # they had a valid best lap. A fallback that can override a working
+    # primary signal is not a fallback, it is a second, worse primary.
+    if any(p.status_flags for p in players):
+        return False
     if local is not None:
         return local.finished and MIN_LAP_MS <= local.best_lap_ms <= MAX_LAP_MS
     return all(p.finished for p in players)
