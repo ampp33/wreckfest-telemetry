@@ -79,6 +79,87 @@ Tools exposed:
 
 _Newest first. Add an entry whenever something breaks, gets fixed, or a new quirk is discovered._
 
+- **2026-08-16 — `lap_count` and `opponent_count` wired into the JSON; `lap_count` and `lap_times_ms` added to the API payload (user request).**
+
+  New `read_race_settings(pid)` reads both from the already-resolved `event_settings` object (`EVENT_SETTINGS_LAP_COUNT_OFF = 0x108`, `EVENT_SETTINGS_OPPONENTS_OFF = 0x10c`), called once per finalized race. Range-checked (`0 < laps <= 100`, `0 <= opponents <= MAX_PLAYERS`) and, when unresolved, **omitted from output rather than exported as 0** -- same principle as the lap-splits keys: absent means "not available", never a misleading zero. Verified both present and both omitted.
+
+  **The API payload gains its first non-scalar field** -- `lap_times_ms` is a list on a payload that was previously flat scalars plus the `notes` string, and the endpoint answers HTTP 200 even for validation failures, so a backend rejecting unknown fields would fail SILENTLY.
+  - **VERIFIED LIVE 2026-08-16** after the user added the columns to the Supabase function: a real race posted and reported **`Posted to API`**, which is driven by the in-body `"success"` field rather than the status code (`post_race_result` checks the body precisely because of the 200-on-failure behaviour). Payload accepted with `lap_count = 3` and `lap_times_ms = [24289, 21003, 20521]`. This was the last completely unexercised path in the tool -- nothing had been posted at all during the session, everything having run `--no-api`.
+  - **Residual gap, not verifiable from this side**: in-body success confirms the function accepted the call, not that every column was populated. A permissive function could accept a subtly-misnamed field and silently drop the value. Worth confirming the stored row once.
+
+  `lap_count` is genuinely new information for the backend: a race where nobody covers the distance (observed live -- 4 laps configured, leaders finished on 3) is otherwise indistinguishable from a shorter race everyone completed.
+
+- **2026-08-16 — one 24-racer race settled BOTH open unknowns and exposed a real accumulator bug. Rejection diagnostics paid for themselves immediately.**
+
+  **`event_settings + 0x10c` is the OPPONENT COUNT** (racers - 1). Read **23** in a 24-racer race, having read **17** in an 18-racer one. Two different lobby sizes, both exact. Previously untestable -- both prior samples were 18-racer lobbies, so a constant 17 proved nothing.
+
+  **`event_settings + 0x108` is the LAP COUNT -- third confirmation, and the first where the distance was actually covered**: read `4`, user finished 1st having completed 4 laps (`max laps == configured`). Earlier samples were 10<->10 and 4<->4-where-nobody-finished.
+
+  **Accumulator bug found and fixed: a stale `OFF_LAST_LAP` was being recorded as a real split.** The new rejection diagnostics printed `CiF  count  2 splits vs 1 laps` -- MORE splits than laps, the opposite of the duplicate-lap-time hypothesis that had been the leading suspicion. Cause: at race start `OFF_LAST_LAP` still holds the PREVIOUS race's final lap, and the accumulator appended it the first time it saw the slot. **Fix**: on first sight of a slot, adopt whatever the field currently holds WITHOUT recording it -- only a change observed while watching is a real lap. Verified: a simulated stale start followed by three real laps now records exactly the three.
+  - Validation had already caught this (the racer's splits were rejected, not exported wrong), but rejecting good data because of an invented split is still a loss -- `CiF`'s single real lap was thrown away with the phantom one.
+  - **The diagnostics were added specifically to answer "why did `Bone Hurting Juice` get rejected", and immediately answered a different question instead.** The hypothesis they were built to test (duplicate consecutive lap times) was wrong; the actual bug was over-counting, not under-counting.
+
+  **IMMEDIATELY REGRESSED, and caught by the very next race.** The "adopt on first sight without recording" fix above traded an over-count for an under-count: **all 8 racers** in the next race reported `8 splits vs 10 laps`. Cause: a racer only becomes VISIBLE to `scrape_players()` once they have a valid best lap, which does not exist until lap 1 is complete -- so the first sight of any racer already has their real lap 1 in `OFF_LAST_LAP`, and blanket-skipping it lost lap 1 for everyone. Losing one lap then also cost lap 10, because the derive step only fires when exactly one lap is missing.
+    - **Correct fix**: decide by the lap counter rather than blanket-skipping. `0 laps done` -> the value is the previous race's leftover, skip it (the `CiF` case). `1 lap done` -> it is that racer's real lap 1, record it (the normal case). `2+ laps done` -> the tool attached mid-race, record nothing and let the count check reject. All three verified synthetically, including a full 10-lap finisher whose splits sum exactly to total.
+    - **Two bugs in two consecutive races, in opposite directions, in the same six lines.** Both were only visible because the rejection diagnostics print the direction of the mismatch (`2 splits vs 1 laps` vs `8 splits vs 10 laps`); without them each would have looked like an unexplained silent omission. The validator did its job both times -- nothing wrong was ever exported -- but "safe" is not "correct", and a race's splits were lost each time.
+
+  **CLEAN RUN, splits now proven** (Hilltop Stadium, 4 racers, 3 laps): **zero rejections**, local player's splits `24.959 / 21.060 / 20.738` passing all three checks exactly -- count == laps, min == best_lap, sum == total. `event_settings` read `laps=3, opponents=3`, matching. Opponents correctly carried no lap keys (flag off), and the attach re-log suppression held -- the log did not gain a duplicate across a restart. This is the first race where the lap-split path needed no correction afterwards.
+
+  **Known remaining limitation, deliberately not fixed**: two consecutive laps run to the same millisecond would record as one, since accumulation keys off the value changing. Keying off the lap counter instead is not straightforward -- the counter increments slightly BEFORE `OFF_LAST_LAP` updates (observed directly in the lap-split probe), so appending on the counter would capture the previous lap again. Millisecond-identical consecutive laps are vanishingly rare, and the count check rejects the race's splits rather than exporting them short, so the failure mode is safe.
+
+- **2026-08-16 — the race's CONFIGURED LAP COUNT is at `event_settings + 0x108`. Three matching live samples. Not yet wired into the tool.**
+
+  User asked whether the race distance is knowable even when nobody completes it -- e.g. a 10-lap race where everyone crashes out on lap 2. Nothing in the tool read it; per-player lap counts cannot reconstruct it.
+
+  **Evidence** (`event_settings` resolves via the existing hash-registry lookup, persists at a stable address, and survives into menus):
+  | sample | `+0x108` | `+0x0a8` |
+  |---|---|---|
+  | during/after a 10-lap race | 10 | 10 |
+  | after that race cleared, lobby set to 4 laps | 4 | 10 |
+  | before/during/after a 4-lap race | 4 | 10 |
+
+  `+0x0a8` is pinned at 10 regardless -- a maximum or default, not the setting. `+0x108` tracks the configured value.
+
+  **A wrong turn worth recording**: `+0x108` was initially RULED OUT. Seeing it go `10 -> 4` right after results cleared, it was read as "volatile" -- but the lobby had simply already moved on to the next race's settings, and that `4` was the upcoming 4-lap race. A legitimate update was mistaken for instability, and the conclusion was exactly inverted (`+0x0a8`, the constant, was briefly declared the winner *because* it was constant). The lesson: for a *settings* field, changing when the setting changes is the expected behaviour, not a disqualification.
+
+  **Why it matters, demonstrated live**: the 4-lap race ended with the winner on **3 laps and NOT flagged DNF** -- the time limit expired before anyone covered the distance. Read from the results alone that is indistinguishable from a 3-lap race. `+0x108` reported 4 correctly throughout.
+
+  **CONFIRMED, after a false retraction.** The 4-lap race ended with the leaders' raw counters at **4** (i.e. on lap 4, having completed 3) and everyone else at 3 -- nobody reached 5, so nobody covered the full distance. Reading "3 cars completed the race" as "3 cars covered 4 laps", the `+0x108 = 4` finding was briefly RETRACTED as inconsistent. It was not: the user confirmed the lobby was set to **4 laps**, and the 3 cars in question were simply the only ones on the lead lap, a full lap clear of the pack. The field was right; the interpretation of "completed" was wrong. Two clean samples stand: **10 <-> 10** and **4 <-> 4**.
+  - Worth noting how close this came to discarding a correct finding: the retraction was reasoned carefully and was still wrong, because it rested on an assumption about what a human meant by "completed" rather than on what the counters said. When live data and a verbal report disagree, the ambiguity is at least as likely to be in the words.
+
+  **Not implemented yet.** Adding it would mean a `race_laps` field alongside `track`/`variation` in the logged JSON, letting consumers compute completion fractions and distinguish "sprint everyone finished" from "long race everyone crashed out of". Also unconfirmed and adjacent: `+0x10c` read **17** across both races, matching the opponent count exactly in an 18-racer lobby, but has never been observed against a different lobby size.
+
+- **2026-08-16 — opponent lap splits are now OPT-IN (`--opponent-lap-times`); the local player's are always logged.** Per user request: a full field's splits roughly quadruple a logged race (an 18-racer entry went ~1.5 KB -> **6.4 KB**), and most consumers only want the local player's.
+
+  **Absent key != empty list, deliberately.** With the flag off, the lap-time keys are **omitted entirely** from `others` rather than emitted as `[]`. `[]` already carries a specific meaning -- "splits were attempted and failed validation" (see `resolve_lap_splits`) -- so reusing it for "not logged by configuration" would make two genuinely different situations indistinguishable to anything reading the file. Absent = not logged; empty = attempted and rejected.
+
+  Threaded through `_player_to_dict(include_laps=)` -> `race_to_dict(opponent_laps=)` -> `append_race_log()` -> `_emit_race()`, read from `args` via `getattr` so callers that build their own args namespace (the test harness, the tracer) keep working. The API payload is unaffected -- splits reach the backend through `notes`, which only ever carried the local player's.
+
+- **2026-08-16 — PER-LAP SPLITS added, after finding there is no per-lap array to read. Splits are ACCUMULATED live and validated before export. Verified live across a full 8-racer field.**
+
+  **Discovery method**: snapshot every int32 in a -96..+320 window around the local player's slot on every poll, and diff at each lap-counter increment through a real 5-lap race. A per-lap array would have to gain a value at the instant a lap completes; nothing did.
+  - **`OFF_LAST_LAP` (+8)** -- the time of the lap that JUST completed. Proven by a slow lap: at lap 3 it went `15543 -> 27289` while `best_lap` correctly stayed at `15543`, ruling out it being a copy of the best-lap field. User independently confirmed "lap 3 was the slow one, 4 was also slower", matching the captured `17179, 15543, 27289, 22255`.
+  - **`OFF_CURRENT_LAP` (+4)** -- the CURRENT lap's running timer. Recorded only so it is not mistaken for a completed time: mid-lap-5 it read `15702` against a true `15706`, i.e. it misleads by being *almost* right.
+  - **No array exists** anywhere in the window, across four consecutive lap boundaries. This is why splits must be accumulated rather than read.
+  - `+0` looked cumulative at one boundary (`17179+15543=32722`) then stopped updating. Meaning unknown; deliberately not used.
+
+  **Implementation**: `_accumulate_lap_splits()` runs on every poll for EVERY racer (each slot has its own `+8`), appending on change. `resolve_lap_splits()` finalizes once per race.
+  - **The final lap is never written to `+8`** -- crossing the finish ends the race rather than starting a lap -- so it is derived as `total_time_ms - sum(observed)`. That lands exactly because the clock stops dead at the line (`17179+15543+27289+22255+15706 = 97972` precisely).
+  - **Two independent cross-checks must both pass or splits are dropped entirely**: count matches the lap counter, and `min(splits) == best_lap_ms`. Partial data is never exported -- a short list that looks complete is exactly the failure mode this project keeps hitting.
+
+  **Verified live, 8-racer online race**: all **8/8** racers exported splits, every one passing sum-equals-total and min-equals-best independently. Also replayed the earlier captured race through the code: full sequence reproduces exactly, and a simulated mid-race start correctly exports `[]`.
+
+  **Known limitation, structural**: splits exist only for laps observed while the tool was running. Start it mid-race and earlier laps are unrecoverable -- there is no array to read them back from. The validation turns this into an honest omission rather than wrong data.
+
+  **Also fixed**: `lap_times_ms` previously held `[best_lap_ms]`, so a 5-lap race exported exactly one "lap time" -- a field whose name promised splits while delivering the best lap. It now starts empty and fills only with genuine splits.
+
+  **API**: splits ride in the payload's `notes` (the same rendered table), so the backend receives them with **no schema change**. Deliberately NOT added as a structured field -- that endpoint answers HTTP 200 even on validation failure, making an unagreed field a silent-failure risk. Structured export needs backend agreement plus one real post checked for in-body `success`.
+
+  **DNF splits: now designed for, and VERIFIED live on an 18-racer race with 13 DNFs.** Reasoning through the case before that race found a real hole: for a DNF the clock freezes MID-LAP, so `total - sum` is a partial lap, not a lap time -- and had a split also been missed it would have yielded (missed lap + partial lap), a value easily inside the plausible range that would pass the count check and export as genuine. **Fix**: the derive step is now restricted to racers who actually finished (`not p.dnf`). A DNF does not need it -- they never crossed a finish line to end the race, so their final completed lap WAS written to `OFF_LAST_LAP` and is already captured.
+  - **Live result** (Kingston Raceway, 18 racers): **5 finishers** exported splits summing EXACTLY to their totals; **11 DNFs** exported splits summing BELOW their totals (the incomplete final lap correctly excluded); **2 DNFs with zero laps** correctly exported nothing. Every racer independently passed `min(splits) == best_lap_ms` and count-matches-counter. DNF lap counts spanned **0, 1, 2 and 4**, so the behaviour held for a lap-1 dropout as well as a lap-4 one.
+  - **The sum test is direction-dependent, and that is the point**: for a finisher, `sum < total` means a missing lap; for a DNF, `sum < total` is correct and expected. Confirmed on real data in both directions in the same race.
+  - Without the guard, all 11 DNFs would have had a fabricated final lap appended.
+
 - **2026-08-16 — user-reported bug FIXED: PAUSING an offline race logged a result. Root cause caught live on the exact transition, not inferred.**
 
   **The trace** (a `pause_probe.py` printing `_race_is_final()`'s decision inputs on every change) captured it cleanly:

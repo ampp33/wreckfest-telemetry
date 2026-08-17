@@ -139,6 +139,22 @@ OFF_FINISH_POSITION = -32   # byte 0 of the OFF_FINISHED_FLAG word
 #     plus main()'s existing clock-stability check, not by trusting one
 #     player's bit in isolation.
 STATUS_CLASSIFIED_BIT = 0x01
+# Per-lap timing, found live 2026-08-16 by diffing the whole struct at every
+# lap boundary through a 5-lap race (see PROJECT.md for the trace):
+#   OFF_LAST_LAP (+8)    -- the time of the lap that just completed. Updates
+#     on every line crossing EXCEPT the final one (crossing the finish ends
+#     the race rather than starting a new lap), so it yields laps 1..N-1 and
+#     the last lap must be derived as total - sum(others).
+#   OFF_CURRENT_LAP (+4) -- the CURRENT lap's running timer, still counting.
+#     Never a completed lap time; recorded here only so it is not mistaken
+#     for one (it reads a near-miss of the real value mid-lap, which is
+#     exactly how it misleads).
+# There is NO array of per-lap splits anywhere in the struct -- confirmed by
+# diffing offsets -96..+320 across four consecutive lap boundaries. Splits
+# therefore have to be ACCUMULATED live (see _accumulate_lap_splits), which
+# is why they are only available for laps observed while the tool was running.
+OFF_LAST_LAP      = 8
+OFF_CURRENT_LAP   = 4
 OFF_STATUS_FLAGS  = -36
 STATUS_RUN_COMPLETE_BIT  = 0x40
 STATUS_DNF_BIT    = 0x10
@@ -210,6 +226,8 @@ class PlayerResult:
     # or a slot that never finalized), which is meaningful in itself:
     # _race_is_final() keys off STATUS_RUN_COMPLETE_BIT appearing here.
     status_flags:   int = 0
+    # Raw OFF_LAST_LAP value -- the most recently completed lap's time.
+    last_lap_ms:    int = 0
     # The engine's own finishing position, 1-based (see OFF_FINISH_POSITION).
     # 0 means "not read / not populated", which _rank_players() treats as
     # unusable and falls back on.
@@ -246,6 +264,11 @@ class RaceResult:
     timestamp: str
     players:   list
     tuning:    dict = None   # last-known {category: 0-4 index}, if any
+    # Race configuration read from event_settings (see read_race_settings).
+    # 0 means "not resolved" -- these are omitted from output rather than
+    # exported as a misleading zero.
+    lap_count:      int = 0
+    opponent_count: int = 0
 
 
 def ms_to_str(ms: int) -> str:
@@ -461,7 +484,11 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
     if not name:
         return None
 
-    laps = [d['best_lap_ms']] if MIN_LAP_MS <= d['best_lap_ms'] <= MAX_LAP_MS else []
+    # Starts empty and is filled by resolve_lap_splits() from live
+    # accumulation. It used to be seeded with [best_lap_ms], which meant a
+    # 5-lap race exported exactly one "lap time" -- a field whose name
+    # promised per-lap splits while delivering the best lap.
+    laps: list = []
 
     # car is deliberately left blank here -- resolve_car_names() fills it in
     # for every player at once, once per finalized race, from the roster
@@ -481,6 +508,7 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
     finished = bool(flag is not None and flag & FINISHED_BIT)
     laps_completed = ((flag & 0xFFFFFFFF) >> 8) & 0xFF if flag is not None else 0
     status_flags = ri32(f, d['addr'] + OFF_STATUS_FLAGS) or 0
+    last_lap_ms = ri32(f, d['addr'] + OFF_LAST_LAP) or 0
     finish_position = (flag & 0xFF) + 1 if flag is not None else 0
 
     return PlayerResult(
@@ -490,6 +518,7 @@ def read_player(f, d: dict, module_base: Optional[int] = None, table_base: Optio
         total_time_ms=d['total_time_ms'], lap_times_ms=laps, is_local=False,
         finished=finished, laps_completed=laps_completed,
         status_flags=status_flags, finish_position=finish_position,
+        last_lap_ms=last_lap_ms,
     )
 
 
@@ -580,7 +609,11 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
     struct's shape; a single string field is much lower-risk to attempt
     even when that fuller trust isn't warranted, and `_looks_garbled()`
     still catches an outright bad read."""
-    laps = [d['best_lap_ms']] if MIN_LAP_MS <= d['best_lap_ms'] <= MAX_LAP_MS else []
+    # Starts empty and is filled by resolve_lap_splits() from live
+    # accumulation. It used to be seeded with [best_lap_ms], which meant a
+    # 5-lap race exported exactly one "lap time" -- a field whose name
+    # promised per-lap splits while delivering the best lap.
+    laps: list = []
     flag = ri32(f, d['addr'] + OFF_FINISHED_FLAG)
     finished = bool(flag is not None and flag & FINISHED_BIT)
     laps_completed = ((flag & 0xFFFFFFFF) >> 8) & 0xFF if flag is not None else 0
@@ -600,6 +633,7 @@ def _read_player_native_only(f, d: dict) -> PlayerResult:
         finished=finished, laps_completed=laps_completed,
         status_flags=ri32(f, d['addr'] + OFF_STATUS_FLAGS) or 0,
         finish_position=(flag & 0xFF) + 1 if flag is not None else 0,
+        last_lap_ms=ri32(f, d['addr'] + OFF_LAST_LAP) or 0,
     )
 
 
@@ -1082,6 +1116,131 @@ def resolve_car_names(pid: int, players: list) -> None:
             p.car = car_names[p.slot_index]
 
 
+# pid -> {slot_index: {"seen": last OFF_LAST_LAP value, "splits": [ms, ...]}}
+# Live accumulation of per-lap times. Needed because the struct holds no
+# per-lap array (see OFF_LAST_LAP) -- only the most recent lap -- so splits
+# exist ONLY for laps observed while the tool was running.
+_LAP_SPLITS: dict = {}
+# (name, reason, detail) for racers whose splits failed validation this race --
+# reported once per finalized race so rejections are visible, not silent.
+_LAP_SPLIT_REJECTS: list = []
+
+
+def _accumulate_lap_splits(pid: Optional[int], players: list) -> None:
+    """Records each lap time as it completes, for every racer.
+
+    Called on every poll. OFF_LAST_LAP holds the just-finished lap, so a
+    change in that field means a lap completed and the NEW value is its
+    time. Tracks all racers, not just the local player, since each slot
+    carries its own field.
+
+    Resets a slot's history when its lap counter goes backwards (a new race
+    reusing the same slot), so splits cannot bleed between races."""
+    if pid is None:
+        return
+    per_pid = _LAP_SPLITS.setdefault(pid, {})
+    for p in players:
+        if p.slot_index is None:
+            continue
+        first_sight = p.slot_index not in per_pid
+        st = per_pid.setdefault(p.slot_index, {"seen": None, "splits": [], "ctr": 0})
+        if p.laps_completed < st["ctr"]:        # counter went backwards -> new race
+            st["seen"], st["splits"], first_sight = None, [], True
+        st["ctr"] = p.laps_completed
+        v = p.last_lap_ms
+        if first_sight:
+            # First time this slot is seen. OFF_LAST_LAP already holds
+            # something, and whether it is REAL or STALE depends entirely on
+            # how many laps this racer has completed:
+            #
+            #   0 laps  -> the field still holds the PREVIOUS race's final
+            #              lap. Recording it invents a split never driven.
+            #              (Caught live: `CiF`, "2 splits vs 1 laps".)
+            #   1 lap   -> the field holds their REAL lap 1. This is the
+            #              normal case, because a racer only becomes visible
+            #              to scrape_players() once they have a valid best
+            #              lap -- which does not exist until lap 1 is done.
+            #              Skipping it loses lap 1 for EVERY racer. (Caught
+            #              live one race later: all 8 racers "8 splits vs 10
+            #              laps" -- short by lap 1, and then short by lap 10
+            #              too, because the derive step only fires when
+            #              exactly one lap is missing.)
+            #   2+ laps -> the tool attached mid-race; earlier laps are
+            #              unrecoverable, so record nothing and let the count
+            #              check reject.
+            laps_done = max(0, p.laps_completed - 1)
+            if laps_done == 1 and v and MIN_LAP_MS <= v <= MAX_LAP_MS:
+                st["splits"].append(v)
+            st["seen"] = v
+            continue
+        if v and MIN_LAP_MS <= v <= MAX_LAP_MS and v != st["seen"]:
+            st["splits"].append(v)
+            st["seen"] = v
+
+
+def resolve_lap_splits(pid: Optional[int], players: list) -> None:
+    """Attaches validated per-lap splits to each player, once per finalized race.
+
+    The final lap is never written to OFF_LAST_LAP (crossing the finish ends
+    the race instead of starting a new lap), so it is derived as
+    `total_time_ms - sum(observed)`. That lands exactly, because the clock
+    stops dead at the line -- verified live: observed 17179+15543+27289+22255
+    against a 97972 total gives a final lap of 15706, and the five sum to
+    97972 precisely.
+
+    Two independent cross-checks must BOTH pass before splits are exported:
+      * the count matches the lap counter, and
+      * min(splits) == best_lap_ms.
+    If either fails, splits are dropped entirely rather than exported
+    partially. A short list that looks complete is exactly the kind of
+    quietly-wrong data this project keeps getting bitten by -- the usual
+    cause is simply that the tool was not running for the whole race, which
+    is unrecoverable since there is no array to read earlier laps back from."""
+    if pid is None:
+        return
+    _LAP_SPLIT_REJECTS.clear()
+    per_pid = _LAP_SPLITS.get(pid) or {}
+    for p in players:
+        st = per_pid.get(p.slot_index)
+        if not st:
+            continue
+        splits = list(st["splits"])
+        expected = max(0, p.laps_completed - 1)
+        if not splits or not expected:
+            continue
+        # Derive the unrecorded final lap when exactly one is missing -- but
+        # ONLY for a racer who actually finished. The derivation is
+        # `total - sum`, which is a real lap time only because the clock
+        # stops dead at the finish line. A DNF's clock freezes MID-LAP, so
+        # the same subtraction yields a partial lap, and if a split had also
+        # been missed it would yield (missed lap + partial lap) -- a value
+        # that can easily fall in the plausible range, satisfy the count
+        # check, and export as a genuine lap time. A DNF does not need the
+        # derivation anyway: they never crossed a finish line to end the
+        # race, so their final completed lap WAS written to OFF_LAST_LAP and
+        # is already in `splits`.
+        if not p.dnf and len(splits) == expected - 1:
+            remainder = p.total_time_ms - sum(splits)
+            if MIN_LAP_MS <= remainder <= MAX_LAP_MS:
+                splits.append(remainder)
+        # Diagnose rejections rather than failing silently. Caught live
+        # 2026-08-16: one racer out of 18 (`Bone Hurting Juice`, 6 laps, a
+        # valid best lap) had splits rejected with no way to tell which check
+        # failed. Leading suspicion is that the accumulator only appends when
+        # OFF_LAST_LAP *changes*, so two laps run to the same millisecond
+        # would record as one -- but that is a hypothesis, and this is what
+        # distinguishes it from a missed poll or a bad best-lap read.
+        if len(splits) != expected:
+            _LAP_SPLIT_REJECTS.append(
+                (p.name, "count", f"{len(splits)} splits vs {expected} laps"))
+            continue
+        if p.best_lap_ms and min(splits) != p.best_lap_ms:
+            _LAP_SPLIT_REJECTS.append(
+                (p.name, "best-lap", f"min={min(splits)} vs best={p.best_lap_ms}"))
+            continue
+        p.lap_times_ms = splits
+
+
 def _position_sort_key(p: PlayerResult) -> tuple:
     """Ranks by laps_completed first (descending -- more laps completed
     always outranks fewer), total_time_ms as the tiebreak within an equal
@@ -1175,6 +1334,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
                 # otherwise never get the salvage path a chance to run.
                 _mark_local_player(f, module_base, table_base, cached_pairs, slot0, pid)
                 _count_still_racing(f, slot0, pid)
+                _accumulate_lap_splits(pid, [p for _, p in cached_pairs])
                 if cached_pairs:
                     cached_players = _rank_players([p for _, p in cached_pairs])
                     for i, p in enumerate(cached_players):
@@ -1217,6 +1377,7 @@ def scrape_players(pid: int, cached_addrs: Optional[list]) -> tuple:
             # branch above.
             _mark_local_player(f, module_base, table_base, pairs, slot0, pid)
             _count_still_racing(f, slot0, pid)
+            _accumulate_lap_splits(pid, [p for _, p in pairs])
             if not pairs:
                 return None, None
     except _PROC_ERRORS:
@@ -1478,6 +1639,43 @@ def _resolve_environment_display_name(f, env_obj: int) -> Optional[str]:
         return None
     name_ptr = ru64(f, sub + 0x18)
     return rcstr(f, name_ptr, 64) if name_ptr else None
+
+
+# Race configuration, found live 2026-08-16 in the same event_settings object
+# the track/variation chain already resolves. Both verified across three
+# different races each:
+#   EVENT_SETTINGS_LAP_COUNT_OFF   -- configured race distance. 10 <-> 10,
+#     4 <-> 4 (a race nobody covered, where it is the ONLY way to know the
+#     distance), 3 <-> 3. Readable during the race, not just at results.
+#   EVENT_SETTINGS_OPPONENTS_OFF   -- opponent count, i.e. racers - 1.
+#     17 in an 18-racer lobby, 23 in a 24-racer one, 3 in a 4-racer one.
+# A nearby field at +0xa8 sat constant at 10 through all of them and is NOT
+# the lap count -- it was briefly mistaken for it precisely BECAUSE it never
+# changed, which for a settings field is disqualifying rather than reassuring.
+EVENT_SETTINGS_LAP_COUNT_OFF = 0x108
+EVENT_SETTINGS_OPPONENTS_OFF = 0x10c
+
+
+def read_race_settings(pid: int) -> tuple:
+    """(lap_count, opponent_count) from the live event_settings object.
+    Returns (0, 0) if it can't be resolved -- callers omit rather than
+    export a misleading zero."""
+    try:
+        with _mem_and_bases(pid) as (f, module_base, table_base):
+            if not table_base:
+                return 0, 0
+            obj = _hash_registry_lookup(f, table_base, "event_settings")
+            if not obj:
+                return 0, 0
+            laps = ri32(f, obj + EVENT_SETTINGS_LAP_COUNT_OFF) or 0
+            opps = ri32(f, obj + EVENT_SETTINGS_OPPONENTS_OFF) or 0
+            if not (0 < laps <= 100):
+                laps = 0
+            if not (0 <= opps <= MAX_PLAYERS):
+                opps = 0
+            return laps, opps
+    except _MEM_ERRORS:
+        return 0, 0
 
 
 def detect_track_and_variation(pid: int) -> tuple:
@@ -2027,6 +2225,18 @@ def _race_results_table_str(race: RaceResult, width: int = 82) -> str:
                       f"{ms_to_str(p.best_lap_ms):<11} {ms_to_str(p.total_time_ms):<11} "
                       f"{'DNF' if p.dnf else ''}".rstrip())
     lines.append("=" * width)
+    # Per-lap splits for the local player, when live accumulation captured a
+    # validated full set (see resolve_lap_splits). Rendered here rather than
+    # as a separate API field because this same string is the payload's
+    # `notes`, so it reaches the backend with no schema change -- and the
+    # endpoint answers HTTP 200 even on validation failure, which makes
+    # adding an unagreed field a silent-failure risk.
+    local = next((p for p in race.players if p.is_local), None)
+    if local is not None and local.lap_times_ms:
+        splits = "  ".join(f"L{i+1} {ms_to_str(t)}"
+                           for i, t in enumerate(local.lap_times_ms))
+        lines.append(f"  LAPS ({local.name}): {splits}")
+        lines.append("=" * width)
     return "\n".join(lines)
 
 
@@ -2047,8 +2257,14 @@ def print_table(race: RaceResult):
     print()
 
 
-def _player_to_dict(p: PlayerResult) -> dict:
-    return {
+def _player_to_dict(p: PlayerResult, include_laps: bool = True) -> dict:
+    """`include_laps=False` OMITS the lap-time keys entirely rather than
+    emitting empty lists. That distinction is deliberate: `[]` already means
+    "splits could not be validated for this racer" (see resolve_lap_splits),
+    so reusing it for "not logged by configuration" would make two different
+    situations indistinguishable to anything reading the file. Absent key =
+    not logged; empty list = attempted and rejected."""
+    d = {
         "position":      p.position,
         "name":          p.name,
         "car":           p.car,
@@ -2057,8 +2273,7 @@ def _player_to_dict(p: PlayerResult) -> dict:
         "total_time_ms": p.total_time_ms,
         "best_lap":      ms_to_str(p.best_lap_ms),
         "total_time":    ms_to_str(p.total_time_ms),
-        "lap_times_ms":  p.lap_times_ms,
-        "lap_times":     [ms_to_str(t) for t in p.lap_times_ms],
+
         # Engine's own DNF flag (STATUS_DNF_BIT) -- not inferred from times.
         # Every racer is in this payload now, including those who completed
         # zero laps, so without this a DNF is indistinguishable from a
@@ -2071,24 +2286,34 @@ def _player_to_dict(p: PlayerResult) -> dict:
         # actual count rather than the raw internal value.
         "laps_completed": max(0, p.laps_completed - 1),
     }
+    if include_laps:
+        d["lap_times_ms"] = p.lap_times_ms
+        d["lap_times"] = [ms_to_str(t) for t in p.lap_times_ms]
+    return d
 
 
-def race_to_dict(race: RaceResult) -> dict:
+def race_to_dict(race: RaceResult, opponent_laps: bool = False) -> dict:
+    """Opponent lap splits are OFF by default -- they roughly quadruple the
+    size of a logged race (a 18-racer entry goes ~1.5 KB -> ~6.4 KB) and most
+    consumers only care about the local player's. Enable with
+    --opponent-lap-times."""
     local = next((p for p in race.players if p.is_local), None)
     others = [p for p in race.players if not p.is_local]
     return {
         "track":     race.track,
         "variation": race.variation,
         "timestamp": race.timestamp,
+        **({"lap_count": race.lap_count} if race.lap_count else {}),
+        **({"opponent_count": race.opponent_count} if race.opponent_count else {}),
         "tuning":    race.tuning or {},
         "player":    _player_to_dict(local) if local else None,
-        "others":    [_player_to_dict(p) for p in others],
+        "others":    [_player_to_dict(p, include_laps=opponent_laps) for p in others],
     }
 
 
-def append_race_log(race: RaceResult, log_path: str):
+def append_race_log(race: RaceResult, log_path: str, opponent_laps: bool = False):
     with open(log_path, "a") as f:
-        f.write(json.dumps(race_to_dict(race)) + "\n")
+        f.write(json.dumps(race_to_dict(race, opponent_laps)) + "\n")
 
 
 # ── API config / posting (Wreckfest 2 Race Log backend) ──────────────────────
@@ -2142,6 +2367,14 @@ def _race_to_api_payload(race: RaceResult) -> Optional[dict]:
         "gear_ratio":        tuning_1indexed("GEARING"),
         "differential":      tuning_1indexed("DIFFERENTIAL"),
         "brake_balance":     tuning_1indexed("BRAKES"),
+        # Race configuration and the local player's per-lap splits, added at
+        # user request 2026-08-16. NOTE: these are NEW fields on a payload
+        # that was previously flat scalars only. The endpoint answers HTTP
+        # 200 even for validation failures, so a backend that rejects unknown
+        # fields would fail SILENTLY -- the first real post after this change
+        # must be checked for the in-body "success", not just the status code.
+        "lap_count":         race.lap_count or None,
+        "lap_times_ms":      list(local.lap_times_ms) or None,
         # Full field/finishing-order table, per user request 2026-08-08 --
         # same plain-text render used for console output (_race_results_table_str,
         # shared with print_table()). Names are already color-code-stripped
@@ -2315,10 +2548,15 @@ def _emit_race(race: RaceResult, args, api_config: dict, allow_api: bool = True)
     to review/correct by hand, but a low-confidence local-player match
     should never get an unreviewable public API post attributed to the
     wrong account."""
+    opp_laps = getattr(args, "opponent_lap_times", False)
     print_table(race)
     if args.json:
-        print(json.dumps(race_to_dict(race), indent=2))
-    append_race_log(race, args.log_file)
+        print(json.dumps(race_to_dict(race, opp_laps), indent=2))
+    if _LAP_SPLIT_REJECTS:
+        print(f"[{_ts()}] lap splits rejected for {len(_LAP_SPLIT_REJECTS)} racer(s):")
+        for name, reason, detail in _LAP_SPLIT_REJECTS:
+            print(f"           {name[:22]:22} {reason:9} {detail}")
+    append_race_log(race, args.log_file, opp_laps)
     print(f"[{_ts()}] Logged to {args.log_file}")
     if not allow_api:
         print(f"[{_ts()}] API post skipped -- local player identity unconfirmed this race (see warning above)")
@@ -2340,6 +2578,9 @@ def main():
                     help="JSON config file with api_key/supabase_url/supabase_anon_key. "
                          "Default: config.json next to this script.")
     ap.add_argument("--no-api",   action="store_true", help="Don't POST results to the configured API")
+    ap.add_argument("--opponent-lap-times", action="store_true",
+                    help="Also log per-lap splits for other racers (default: local player only). "
+                         "Roughly quadruples the size of each logged race.")
     args = ap.parse_args()
 
     print("Wreckfest Race Results Scraper")
@@ -2388,6 +2629,15 @@ def main():
     # blip out cleanly without needing to know why the bit flickers there.
     last_fingerprint_seen   = None   # fingerprint from the previous poll, in any state
     last_logged_fingerprint = None   # fingerprint of the race already logged -- skip re-logging it
+    # A race that was ALREADY finished when we attached is adopted as
+    # "already logged" instead of being emitted. Restarting the tool used to
+    # re-log whatever result was still sitting in memory, which produced a
+    # duplicate of a race already in the file -- and since 2026-08-16 a
+    # strictly WORSE duplicate, because lap splits require having watched the
+    # race and so come back empty (and generate phantom-split rejections).
+    # A genuinely new race can never be mistaken for this: on its first poll
+    # racers are still circulating, so _race_is_final() is False.
+    first_poll = True
     cached_addrs = None
     scan_needed  = True
     # Session-established local-player identity, once resolved -- a safety
@@ -2433,6 +2683,13 @@ def main():
                 else:
                     fingerprint = tuple((p.name, p.total_time_ms) for p in players)
                 is_stable = fingerprint == last_fingerprint_seen
+                if first_poll and _race_is_final(players, pid):
+                    print(f"[{_ts()}] Race already finished when attached — "
+                          f"adopting as already-logged (no splits available). "
+                          f"Waiting for the next race...")
+                    last_logged_fingerprint = fingerprint
+                first_poll = False
+
                 if (_race_is_final(players, pid) and is_stable
                         and fingerprint != last_logged_fingerprint):
                     if args.debug and cached_addrs:
@@ -2441,6 +2698,7 @@ def main():
                             print(f"[debug]   slot @ 0x{a:016x}")
                     resolve_local_car_name(pid, players)
                     resolve_car_names(pid, players)
+                    resolve_lap_splits(pid, players)
                     track, variation = detect_track_and_variation(pid)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
                     # Tuning to attach to this race -- live slider-widget
@@ -2451,7 +2709,9 @@ def main():
                     # player's car name, which resolve_local_car_name() just
                     # filled in above.
                     tuning = read_tuning_for_race(pid, local_player.car) if local_player else {}
-                    race = RaceResult(track=track, variation=variation, timestamp=ts,
+                    lap_count, opponent_count = read_race_settings(pid)
+                    race = RaceResult(lap_count=lap_count, opponent_count=opponent_count,
+                                      track=track, variation=variation, timestamp=ts,
                                       players=players, tuning=tuning)
                     # Identity consistency check -- see confirmed_local_name's
                     # comment above for why this exists at all.
