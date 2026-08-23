@@ -2271,8 +2271,6 @@ def _player_to_dict(p: PlayerResult, include_laps: bool = True) -> dict:
         "class":         p.class_str(),
         "best_lap_ms":   p.best_lap_ms,
         "total_time_ms": p.total_time_ms,
-        "best_lap":      ms_to_str(p.best_lap_ms),
-        "total_time":    ms_to_str(p.total_time_ms),
 
         # Engine's own DNF flag (STATUS_DNF_BIT) -- not inferred from times.
         # Every racer is in this payload now, including those who completed
@@ -2367,19 +2365,15 @@ def _race_to_api_payload(race: RaceResult) -> Optional[dict]:
         "gear_ratio":        tuning_1indexed("GEARING"),
         "differential":      tuning_1indexed("DIFFERENTIAL"),
         "brake_balance":     tuning_1indexed("BRAKES"),
-        # Race configuration and the local player's per-lap splits, added at
-        # user request 2026-08-16. NOTE: these are NEW fields on a payload
-        # that was previously flat scalars only. The endpoint answers HTTP
-        # 200 even for validation failures, so a backend that rejects unknown
-        # fields would fail SILENTLY -- the first real post after this change
-        # must be checked for the in-body "success", not just the status code.
         "lap_count":         race.lap_count or None,
         "lap_times_ms":      list(local.lap_times_ms) or None,
-        # Full field/finishing-order table, per user request 2026-08-08 --
-        # same plain-text render used for console output (_race_results_table_str,
-        # shared with print_table()). Names are already color-code-stripped
-        # at read time, so this needs no extra cleanup here.
-        "notes":             _race_results_table_str(race),
+        # Structured finishing-order roster: all racers sorted by position.
+        # Lap splits omitted per-entry -- local player's are already sent
+        # separately as lap_times_ms above.
+        "results_roster":    sorted(
+            [_player_to_dict(p, include_laps=False) for p in race.players],
+            key=lambda d: d["position"],
+        ),
     }
     for key, value in optional_fields.items():
         if value is not None:
