@@ -21,8 +21,9 @@ This repo's tool started life as `scraper.py` in a shared sandbox repo (alongsid
   python wreckfest_telemetry.py --pid 1234 --watch-tuning # watch the pre-race Tune screen live, print each slider as it's set
   python wreckfest_telemetry.py --pid 1234 --log-file out.jsonl  # append each completed race (+ persisted tuning) as JSON lines (default: race_log.jsonl)
   python wreckfest_telemetry.py --pid 1234 --no-api       # don't POST results even if config.json is set up
+  python wreckfest_telemetry.py --flush-only              # POST any races queued while offline, then exit (no game needed)
   ```
-  `--pid` is required (no auto-detect); see `--help` (or the README) for the full current flag list, including `--interval`/`--debug`/`--config`.
+  `--pid` is required (no auto-detect) except with `--flush-only`; see `--help` (or the README) for the full current flag list, including `--interval`/`--debug`/`--config`/`--queue-file`.
 - **[../wf-memory-tool/memory_mcp_server.py](../wf-memory-tool/memory_mcp_server.py)** *(sibling repo, not in this one)* — MCP server exposing raw CheatEngine-style memory primitives (see below). Used interactively with Claude for *discovery* work — finding new offsets, or re-discovering them after a game update breaks the hardcoded chain.
 - **[../wf-memory-tool/find_pointers.py](../wf-memory-tool/find_pointers.py)** *(sibling repo, not in this one)* — one-off script to reverse-engineer pointer chains: given a known target address, scans all memory for 8-byte-aligned pointers into that address range. Used during initial discovery, not needed at runtime.
 
@@ -78,6 +79,26 @@ Tools exposed:
 ## State / Known Issues
 
 _Newest first. Add an entry whenever something breaks, gets fixed, or a new quirk is discovered._
+
+- **2026-09-02 — offline send queue: races that can't be POSTed are now durable, not dropped (user request).**
+
+  The API sink was fire-and-forget -- `post_race_result()` printed an error and the result was gone, so every race finished while offline was lost to the backend forever. There is now a queue file (`pending_races.jsonl`, defaulted **beside `--log-file`** rather than the cwd or the script, since a cwd-relative default would strand a backlog the moment the tool is started from elsewhere).
+
+  **The load-bearing distinction is transient vs. permanent failure**, and it exists because of this endpoint's 200-on-validation-failure behaviour (see the 2026-08-16 entry). `_post_payload()` was split out of `post_race_result()` and returns `(ok, retryable, message)`:
+  - retryable -> `URLError` (offline/DNS/refused/timeout), HTTP 5xx/408/429, non-JSON body (a captive portal answers exactly like this). Queued.
+  - permanent -> other 4xx, and **HTTP 200 with `"success": false`** -- the endpoint's real rejection signal, which will fail identically on every retry. Moved to `failed_races.jsonl` with the error attached, so one bad payload can never block the good ones behind it or retry forever.
+
+  **Queued unit is the API payload, not the `RaceResult`** -- the payload is what `_race_to_api_payload()` already produces, needs no dataclass (de)serialization, and is not reconstructible from `race_log.jsonl` (which has no `performance_index` and no rendered `notes` table). `api_key` is injected at send time and deliberately **never written to the queue file**, preserving the credential separation `_race_to_api_payload()` was already built around.
+
+  **The queue file is rewritten (atomically, temp + `os.replace`) after each individual send, not once at the end of a flush** -- a crash partway through must not re-post a race the backend already accepted. Verified by simulating a crash between two sends: the accepted race is gone from the queue, the un-sent one survives, and a re-run posts each exactly once.
+
+  **A flush stops at the first retryable failure** rather than walking the rest. If the network is down, every remaining entry only burns another full timeout and stalls the poll loop for no new information. Retries are paced by an in-memory pending count plus a 60/120/300/900s backoff, so a long offline stretch costs one timed-out request every few minutes rather than one per 0.5s poll. Background flushes use a 5s timeout, half a live post's 10s.
+
+  Flush points: startup, before each new race is posted (backlog is older -- **it must land first**, verified by request order at the mock), and the in-loop backoff timer. New `--flush-only` drains the queue and exits with no game running, which required making `--pid` optional with an explicit error rather than `required=True`.
+
+  **`allow_api=False` races are still never sent AND now never queued** -- the identity-mismatch guard would otherwise have been quietly defeated by the queue, since "queued" eventually means "posted".
+
+  Verified with a stdlib mock server exercising all five response modes plus a dead port: 34 checks across classification, offline capture, recovery, dead-lettering, attempt counting, ordering, crash safety, malformed queue lines, and `_emit_race` end-to-end; 12 more driving the CLI (`--flush-only`, `--queue-file`, `--pid` validation); and one running `main()`'s real poll loop with `scrape_players` stubbed, confirming the in-loop retry drains a backlog mid-session when the API comes back. Per the harness-drift warning in `NEXT_SESSION.md`, the tests import and call the real functions rather than mirroring them. **Not yet exercised against the real Supabase endpoint** -- the transient/permanent split is only as good as the real backend's behaviour matching the mock's.
 
 - **2026-08-16 — `lap_count` and `opponent_count` wired into the JSON; `lap_count` and `lap_times_ms` added to the API payload (user request).**
 

@@ -1,4 +1,7 @@
 config.json
+config.local.json
 race_log.jsonl
 __pycache__/
 *.pyc
+pending_races.jsonl
+failed_races.jsonl

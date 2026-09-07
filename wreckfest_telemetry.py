@@ -2387,23 +2387,25 @@ def _race_to_api_payload(race: RaceResult) -> Optional[dict]:
     return payload
 
 
-def post_race_result(config: dict, race: RaceResult, timeout: float = 10.0) -> bool:
-    """POSTs to insert_race_with_api_key. Never raises -- network errors, non-
-    2xx status, or in-body {"success": false} are reported and skipped. Note
-    this endpoint always answers HTTP 200 even for validation failures, so the
-    "success" field is the real signal, not HTTP status alone."""
-    if not _api_config_complete(config):
-        return False
-    payload = _race_to_api_payload(race)
-    if payload is None:
-        print(f"[{_ts()}] API call skipped: no local player identified in this race")
-        return False
-    payload["api_key"] = config["api_key"]
+def _post_payload(config: dict, payload: dict, timeout: float = 10.0) -> tuple:
+    """POSTs one already-built payload. Returns (ok, retryable, message) and
+    never raises.
 
-    url = config["supabase_url"]
-    body = json.dumps(payload).encode("utf-8")
+    The retryable/permanent split is the whole point of this function existing
+    separately from post_race_result(): "the network or the backend is at
+    fault, try again later" and "this payload will be rejected identically
+    forever" look similar from the call site but must be handled differently --
+    the first gets queued (see flush_queue), the second gets dead-lettered.
+    Note that this endpoint answers HTTP 200 even for validation failures, so
+    the in-body "success" field is the real signal -- and an in-body failure is
+    a PERMANENT one, no matter how healthy the 200 looks.
+
+    api_key is injected here, at send time, rather than carried in `payload`:
+    queued payloads get written to disk and the credential must not be."""
+    body = dict(payload)
+    body["api_key"] = config["api_key"]
     req = urllib.request.Request(
-        url, data=body,
+        config["supabase_url"], data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "apikey": config["supabase_anon_key"]},
         method="POST",
     )
@@ -2413,24 +2415,222 @@ def post_race_result(config: dict, race: RaceResult, timeout: float = 10.0) -> b
             raw = resp.read()
     except urllib.error.HTTPError as e:
         status = e.code
-        raw = e.read()
+        try:
+            raw = e.read()
+        except OSError:
+            raw = b""
     except urllib.error.URLError as e:
-        print(f"[{_ts()}] API call failed: {e}")
-        return False
+        # Offline, DNS failure, connection refused, TLS trouble -- and also a
+        # socket timeout, which urllib wraps as a URLError.
+        return False, True, f"network error: {e.reason}"
+    except OSError as e:
+        # http.client can surface these directly (a connection dropped
+        # mid-read, say). Still transport, still worth retrying.
+        return False, True, f"network error: {e}"
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"[{_ts()}] API call failed: HTTP {status}, non-JSON response")
-        return False
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # A backend or proxy answering with something other than JSON is
+        # misbehaving, not rejecting -- a captive portal does exactly this.
+        return False, True, f"HTTP {status}, non-JSON response"
+    if not isinstance(data, dict):
+        return False, True, f"HTTP {status}, unexpected response {raw[:120]!r}"
 
     if not (200 <= status < 300):
-        print(f"[{_ts()}] API call failed: HTTP {status}: {data.get('error', raw)}")
-        return False
+        retryable = status >= 500 or status in (408, 429)
+        return False, retryable, f"HTTP {status}: {data.get('error', raw)}"
     if not data.get("success"):
-        print(f"[{_ts()}] API submission failed: {data.get('error', 'unknown error')}")
+        return False, False, f"rejected: {data.get('error', 'unknown error')}"
+    return True, False, "ok"
+
+
+def post_race_result(config: dict, race: RaceResult, timeout: float = 10.0) -> bool:
+    """One-shot post of a race, with no queueing -- a failure is reported and
+    dropped. _emit_race() uses the queue-aware _post_or_queue() instead; this
+    remains the simple path for anything that just wants a bool."""
+    if not _api_config_complete(config):
         return False
-    return True
+    payload = _race_to_api_payload(race)
+    if payload is None:
+        print(f"[{_ts()}] API call skipped: no local player identified in this race")
+        return False
+    ok, _retryable, message = _post_payload(config, payload, timeout)
+    if not ok:
+        print(f"[{_ts()}] API call failed: {message}")
+    return ok
+
+
+# ── Offline queue: races captured while the API was unreachable ──────────────
+# The file log is durable; the API post was not. A race that fails to post for
+# a TRANSIENT reason is parked here as its ready-to-send payload and replayed
+# in order once connectivity returns -- at startup, before each new post, and
+# on a backoff timer inside the poll loop. Races the backend actually REJECTS
+# are moved to the dead-letter file instead, so one bad payload can never block
+# the good ones behind it or retry forever.
+DEFAULT_QUEUE_NAME = "pending_races.jsonl"
+DEFAULT_DEAD_LETTER_NAME = "failed_races.jsonl"
+# Shorter than a live post's 10s: a background retry shouldn't stall the poll
+# loop for as long as a freshly captured result is worth waiting for.
+QUEUE_POST_TIMEOUT = 5.0
+FLUSH_BACKOFF_SECONDS = (60.0, 120.0, 300.0, 900.0)
+
+
+def read_queue(path: str) -> list:
+    """Queued entries, oldest first. Missing file is not an error. A line that
+    won't parse is skipped rather than poisoning the whole queue -- every race
+    in here is also in the file log, so the queue is the recoverable copy."""
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        print(f"[{_ts()}] WARNING: couldn't read queue file {path}: {e}")
+        return []
+    entries = []
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"[{_ts()}] WARNING: {path} line {n} is unreadable and will be "
+                  f"dropped on the next flush (the race is still in the log file)")
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("payload"), dict):
+            entries.append(entry)
+        else:
+            print(f"[{_ts()}] WARNING: {path} line {n} has no payload object -- skipped")
+    return entries
+
+
+def write_queue(path: str, entries: list) -> None:
+    """Atomic rewrite (temp file + os.replace) so a crash mid-write can never
+    leave a truncated queue. An empty queue removes the file rather than
+    leaving a zero-byte one behind."""
+    if not entries:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[{_ts()}] WARNING: couldn't remove empty queue file {path}: {e}")
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[{_ts()}] WARNING: couldn't write queue file {path}: {e}")
+
+
+def enqueue_payload(path: str, payload: dict, error: str) -> int:
+    """Appends one payload to the queue. Returns the resulting queue length, or
+    0 if it couldn't be written at all."""
+    entry = {
+        "queued_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "attempts": 1,
+        "last_error": error,
+        "payload": payload,
+    }
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        print(f"[{_ts()}] ERROR: couldn't queue race for retry in {path}: {e}")
+        return 0
+    return len(read_queue(path))
+
+
+def append_dead_letter(path: str, entry: dict, error: str) -> None:
+    """Parks a permanently rejected entry, error and all, for manual review."""
+    record = dict(entry)
+    record["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    record["last_error"] = error
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        print(f"[{_ts()}] WARNING: couldn't write dead-letter file {path}: {e}")
+
+
+def flush_queue(config: dict, queue_path: str, dead_path: str,
+                timeout: float = QUEUE_POST_TIMEOUT, verbose: bool = True) -> tuple:
+    """Replays the queue oldest-first. Returns (sent, remaining, dead).
+
+    Stops at the first RETRYABLE failure instead of walking the rest: if the
+    network is down, every remaining entry would just burn another full timeout
+    and stall the caller's poll loop for no new information.
+
+    The queue file is rewritten after each individual send rather than once at
+    the end. That's deliberate -- a crash partway through a flush must not
+    re-post a race the backend already accepted."""
+    if not _api_config_complete(config):
+        return 0, 0, 0
+    entries = read_queue(queue_path)
+    if not entries:
+        return 0, 0, 0
+    sent = dead = 0
+    while entries:
+        entry = entries[0]
+        ok, retryable, message = _post_payload(config, entry["payload"], timeout)
+        if ok:
+            entries.pop(0)
+            write_queue(queue_path, entries)
+            sent += 1
+            continue
+        if retryable:
+            entry["attempts"] = int(entry.get("attempts") or 0) + 1
+            entry["last_error"] = message
+            write_queue(queue_path, entries)
+            if verbose:
+                if sent:
+                    print(f"[{_ts()}] Posted {sent} queued race(s) to API")
+                print(f"[{_ts()}] {len(entries)} race(s) still queued: {message}")
+            return sent, len(entries), dead
+        entries.pop(0)
+        write_queue(queue_path, entries)
+        append_dead_letter(dead_path, entry, message)
+        dead += 1
+        if verbose:
+            print(f"[{_ts()}] WARNING: queued race from {entry.get('queued_at', '?')} "
+                  f"was {message} -- moved to {dead_path}, not retrying")
+    if verbose and sent:
+        print(f"[{_ts()}] Posted {sent} queued race(s) to API")
+    return sent, 0, dead
+
+
+def _post_or_queue(config: dict, payload: dict, queue_path: str, dead_path: str) -> None:
+    """The send path for a freshly captured race: drain any backlog first --
+    older races have to land first -- then post this one, or queue it if the
+    API is still unreachable."""
+    remaining = 0
+    if read_queue(queue_path):
+        _sent, remaining, _dead = flush_queue(config, queue_path, dead_path)
+    if remaining:
+        # The backlog just failed, so the API is still down. Queue this race
+        # directly rather than spending another full timeout proving it.
+        count = enqueue_payload(queue_path, payload,
+                                "queued behind an unflushed backlog")
+        print(f"[{_ts()}] API still unreachable -- race queued for retry ({count} pending)")
+        return
+    ok, retryable, message = _post_payload(config, payload)
+    if ok:
+        print(f"[{_ts()}] Posted to API")
+    elif retryable:
+        count = enqueue_payload(queue_path, payload, message)
+        print(f"[{_ts()}] API post failed ({message}) -- race queued for retry ({count} pending)")
+    else:
+        append_dead_letter(dead_path,
+                           {"queued_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "attempts": 1, "payload": payload}, message)
+        print(f"[{_ts()}] WARNING: API {message} -- saved to {dead_path} for review, not retrying")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -2560,13 +2760,19 @@ def _emit_race(race: RaceResult, args, api_config: dict, allow_api: bool = True)
     print(f"[{_ts()}] Logged to {args.log_file}")
     if not allow_api:
         print(f"[{_ts()}] API post skipped -- local player identity unconfirmed this race (see warning above)")
-    elif api_config and post_race_result(api_config, race):
-        print(f"[{_ts()}] Posted to API")
+        return
+    if not _api_config_complete(api_config):
+        return
+    payload = _race_to_api_payload(race)
+    if payload is None:
+        print(f"[{_ts()}] API call skipped: no local player identified in this race")
+        return
+    _post_or_queue(api_config, payload, args.queue_file, args.dead_letter_file)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Wreckfest race results scraper")
-    ap.add_argument("--pid",      type=int, required=True, help="Game PID")
+    ap.add_argument("--pid",      type=int, help="Game PID (required unless --flush-only)")
     ap.add_argument("--json",     action="store_true", help="Also emit JSON after the table")
     ap.add_argument("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)")
     ap.add_argument("--debug",    action="store_true", help="Print raw slot addresses for each detected race")
@@ -2578,10 +2784,27 @@ def main():
                     help="JSON config file with api_key/supabase_url/supabase_anon_key. "
                          "Default: config.json next to this script.")
     ap.add_argument("--no-api",   action="store_true", help="Don't POST results to the configured API")
+    ap.add_argument("--queue-file", default=None,
+                    help="Offline queue for races that couldn't be POSTed yet. "
+                         f"Default: {DEFAULT_QUEUE_NAME} beside --log-file.")
+    ap.add_argument("--flush-only", action="store_true",
+                    help="Post any queued races and exit. Doesn't need the game running.")
     ap.add_argument("--opponent-lap-times", action="store_true",
                     help="Also log per-lap splits for other racers (default: local player only). "
                          "Roughly quadruples the size of each logged race.")
     args = ap.parse_args()
+
+    if args.pid is None and not args.flush_only:
+        ap.error("--pid is required (or use --flush-only to post queued races and exit)")
+
+    # The queue lives beside the LOG file, not the config and not the cwd: it's
+    # race data, it's written whenever the log is, and defaulting it to the cwd
+    # the way --log-file does would silently strand a backlog the moment the
+    # tool is started from a different directory.
+    args.queue_file = args.queue_file or os.path.join(
+        os.path.dirname(os.path.abspath(args.log_file)), DEFAULT_QUEUE_NAME)
+    args.dead_letter_file = os.path.join(
+        os.path.dirname(os.path.abspath(args.queue_file)), DEFAULT_DEAD_LETTER_NAME)
 
     print("Wreckfest Race Results Scraper")
     print("-" * 40)
@@ -2592,11 +2815,33 @@ def main():
     else:
         print("API posting: disabled (no config found)" if not args.no_api else "API posting: disabled (--no-api)")
 
+    # Drain anything left over from an offline session before doing anything
+    # else -- the common case is "was offline yesterday, online now".
+    queue_pending = len(read_queue(args.queue_file)) if _api_config_complete(api_config) else 0
+    if queue_pending:
+        print(f"[{_ts()}] {queue_pending} race(s) queued in {args.queue_file} -- flushing...")
+        _sent, queue_pending, _dead = flush_queue(api_config, args.queue_file, args.dead_letter_file)
+        if queue_pending and not args.flush_only:
+            print(f"[{_ts()}] will keep retrying while running")
+
+    if args.flush_only:
+        if not _api_config_complete(api_config):
+            print("Nothing to flush: API posting is disabled.")
+        elif not queue_pending:
+            print(f"[{_ts()}] Offline queue is empty.")
+        return
+
     if args.watch_tuning:
         watch_tuning(args.pid, args.interval)
         return
 
     pid = args.pid
+    # Offline-queue retry pacing. The poll loop runs several times a second, so
+    # the queue is only touched when we know something is in it AND the backoff
+    # has expired: a long offline stretch then costs one timed-out request every
+    # few minutes instead of one per poll.
+    flush_backoff_idx = 0
+    next_flush_at = time.time() + FLUSH_BACKOFF_SECONDS[0]
     print(f"Attached to PID {pid}")
     print(f"Polling every {args.interval}s — press Ctrl+C to stop")
     print("(Initial scan may take ~10s while memory is indexed)\n")
@@ -2727,6 +2972,10 @@ def main():
                                   f"for this race. Logging to file, but skipping the API post "
                                   f"to avoid attributing someone else's result to your account.")
                     _emit_race(race, args, api_config, allow_api=identity_trusted)
+                    if _api_config_complete(api_config):
+                        queue_pending = len(read_queue(args.queue_file))
+                        flush_backoff_idx = 0
+                        next_flush_at = time.time() + FLUSH_BACKOFF_SECONDS[0]
                     last_logged_fingerprint = fingerprint
                 last_fingerprint_seen = fingerprint
             else:
@@ -2734,6 +2983,13 @@ def main():
                     print(f"[{_ts()}] Results cleared — waiting for next race...")
                 last_fingerprint_seen = None
                 last_logged_fingerprint = None
+
+            if queue_pending and time.time() >= next_flush_at:
+                sent, queue_pending, _dead = flush_queue(
+                    api_config, args.queue_file, args.dead_letter_file)
+                flush_backoff_idx = 0 if sent else min(flush_backoff_idx + 1,
+                                                       len(FLUSH_BACKOFF_SECONDS) - 1)
+                next_flush_at = time.time() + FLUSH_BACKOFF_SECONDS[flush_backoff_idx]
 
             time.sleep(args.interval)
 

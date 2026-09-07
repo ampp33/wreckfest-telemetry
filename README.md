@@ -28,17 +28,41 @@ It attaches, waits for a race to actually finish, then prints a results table an
 
 | Flag | Effect |
 |---|---|
-| `--pid PID` | **Required.** The Wreckfest process PID. |
+| `--pid PID` | **Required** (except with `--flush-only`). The Wreckfest process PID. |
 | `--interval SECONDS` | Poll interval (default `0.5`). |
 | `--json` | Also print each race as JSON to stdout. |
 | `--log-file PATH` | JSON-lines file to append races to (default `race_log.jsonl`). |
 | `--watch-tuning` | Instead of racing, watch the pre-race tuning screen and print each slider value as you set it. |
 | `--debug` | Print the raw memory addresses used for each detected race. |
 | `--no-api` | Don't POST to the configured API, even if `config.json` is set up. |
+| `--queue-file PATH` | Offline queue of races that haven't been POSTed yet (default `pending_races.jsonl`, beside the log file). |
+| `--flush-only` | POST any queued races and exit. Doesn't need the game running or a `--pid`. |
 
 ## Posting results to an API (optional)
 
 Copy `config.json.example` to `config.json` and fill in your `api_key`, `supabase_url`, and `supabase_anon_key`. With that in place, every completed race is POSTed automatically, in addition to being appended to the log file. If `config.json` is missing or incomplete, API posting is silently disabled — everything else works the same either way.
+
+### Running offline
+
+You don't have to be online to race. If a POST fails for a *transient* reason — no
+network, DNS failure, the backend down or timing out — the race is parked in
+`pending_races.jsonl` next to your log file, and retried automatically: once at
+startup, before each new race is posted, and on a slowing timer (1 → 2 → 5 → 15
+minutes) while the tool runs. Queued races are sent oldest-first, so results
+arrive in the order you raced them, and a race is removed from the queue the
+moment the backend accepts it — a crash mid-flush can't double-post.
+
+To drain the queue by hand after a session, with the game closed:
+
+```bash
+python3 wreckfest_telemetry.py --flush-only
+```
+
+If the endpoint actually *rejects* a race (a validation failure, or a bad
+`api_key`), retrying would fail identically forever — so that one is moved to
+`failed_races.jsonl` with the error attached and skipped, leaving the rest of
+the queue to go through. The race is still in your log file either way; the
+queue is only ever the second copy.
 
 ## How it works
 
