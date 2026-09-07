@@ -939,12 +939,59 @@ def resolve_local_car_name(pid: int, players: list) -> None:
 # while this table already had the correct, resolved, human-readable name.
 # Also confirmed persistent across races within one game session -- same
 # base address, overwritten in place each race, not reallocated -- but there
-# is no known static pointer chain to it (unlike the main player array), so
-# it has to be structurally re-discovered per pid, same as the sentinel-scan
-# fallback for the player array itself.
+# is no known static pointer chain to it (unlike the main player array). A
+# thorough, method-validated pointer hunt on 2026-08-16 (see PROJECT.md)
+# scanned ~2.8 GB of readable memory for any 8-byte-aligned pointer landing
+# on the table or within a +-8KB window around it -- zero hits, and the
+# scanner was proven live against a pointer known to exist first (it found
+# CHAIN_STATIC_OFFSET), so the zero is real: nothing in the process ever
+# stores a pointer to this table.
+#
+# That is a different question from "is the table's own ADDRESS
+# predictable", though, and re-checked live 2026-08-27 against a completely
+# separate game launch: the table landed at module_base+0x19fae50 -- the
+# exact same offset PROJECT.md recorded on 2026-08-16, 11 days and one full
+# game restart apart. ASLR is evidently off for this module, and whatever
+# reserves this table's memory does so deterministically at process start,
+# before anything session-specific (track, lobby size, career state) could
+# perturb it. So while no in-memory chain reaches this table, a hardcoded
+# offset from module_base does -- same practical effect as
+# CHAIN_STATIC_OFFSET for the player array, which also has zero static
+# cross-references (see PROJECT.md 2026-07-27) yet is a reliable direct
+# address. See CAR_TABLE_FAST_OFFSET / _fast_car_name_table() below: tried
+# first, validated before being trusted, and left to fall back to this
+# file's structural scan (unchanged, still the safety net) if it ever
+# doesn't check out -- e.g. after a game update relocates it.
 _CAR_NAME_TABLE_STRIDE = 0x80
 _CAR_NAME_TOKEN_RE = re.compile(rb'[A-Z][A-Z ]{2,19}\x00')
 _CAR_NAME_TABLE_CACHE: dict = {}   # pid -> base address of table slot 0
+
+# module_base + this -> car-name table slot 0's address DIRECTLY (the table's
+# own data lives here -- this is not a pointer to dereference, unlike
+# CHAIN_STATIC_OFFSET). See the discovery note above for how this was found
+# and confirmed stable across launches. Never trusted blindly: always
+# validated against the local player's already-known car name before use.
+CAR_TABLE_FAST_OFFSET = 0x19fae50
+
+
+def _fast_car_name_table(f, module_base: Optional[int], local_slot: Optional[int],
+                          local_car_name: Optional[str]) -> Optional[int]:
+    """O(1) fast path for the car-name table's base address -- see
+    CAR_TABLE_FAST_OFFSET's docstring for why a fixed offset works despite no
+    stored pointer existing. Requires both `local_slot` and `local_car_name`
+    (same precondition _get_car_name_table() already enforces for the slow
+    path) so the candidate can be content-validated, not just assumed:
+    reads the candidate table at `local_slot` and only returns it if that
+    slot's name matches the local player's already-independently-known car
+    name (from _local_player_car_name(), not this table). Returns None on any
+    mismatch -- callers fall back to the structural scan, so a future game
+    update that moves this offset degrades gracefully instead of silently
+    serving wrong car names."""
+    if module_base is None or local_slot is None or not local_car_name:
+        return None
+    candidate = module_base + CAR_TABLE_FAST_OFFSET
+    val = rcstr(f, candidate + local_slot * _CAR_NAME_TABLE_STRIDE, 32)
+    return candidate if val.upper() == local_car_name.upper() else None
 
 
 def _stride_runs(hits: list, stride: int, min_run: int = 2) -> list:
@@ -980,7 +1027,25 @@ def _find_car_name_table(pid: int, local_slot: int, local_car_name: str) -> Opti
     reliably by _local_player_car_name(), not through this table or the old
     per-player struct field) shows up at that same run's `local_slot`
     entry -- content match at the one position we can already verify,
-    not just structural shape alone."""
+    not just structural shape alone.
+
+    Tries the CAR_TABLE_FAST_OFFSET direct address first (see its docstring)
+    -- validated the same content-match way, just against one candidate
+    instead of scanning for one. Only falls through to the full scan below
+    if that candidate doesn't check out."""
+    module_base = find_module_base(pid)
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as f:
+            fast = _fast_car_name_table(f, module_base, local_slot, local_car_name)
+            if fast is not None:
+                return fast
+    except _PROC_ERRORS:
+        pass
+
+    # Only reached if CAR_TABLE_FAST_OFFSET didn't validate (e.g. a game
+    # update moved it) -- the expensive path, so worth telling the user why
+    # things paused, same as before this fast path existed.
+    print(f"[{_ts()}] Fast car-name table offset didn't validate -- falling back to a one-time structural scan (~10s)...")
     regions = anon_writable_regions(pid)
     target = local_car_name.upper()
 
@@ -1003,9 +1068,9 @@ def _find_car_name_table(pid: int, local_slot: int, local_car_name: str) -> Opti
     # player's own already-trusted car name must appear at `local_slot`), so
     # reordering cannot make a wrong table win -- it only changes which
     # region is *tried* first, never what counts as a match.
-    module_base = find_module_base(pid) or 0
-    regions = ([r for r in regions if r[0] >= module_base]
-               + [r for r in regions if r[0] < module_base])
+    sort_base = module_base or 0
+    regions = ([r for r in regions if r[0] >= sort_base]
+               + [r for r in regions if r[0] < sort_base])
 
     CHUNK = 8 * 1024 * 1024
     overlap = 24  # >= longest possible token, so a match split across a chunk boundary is never missed
@@ -1106,8 +1171,6 @@ def resolve_car_names(pid: int, players: list) -> None:
     local_player = next((p for p in players if p.is_local), None)
     local_car_name = local_player.car if local_player else None
     local_slot = local_player.slot_index if local_player else None
-    if _CAR_NAME_TABLE_CACHE.get(pid) is None:
-        print(f"[{_ts()}] Locating car-name table (one-time this session, ~10s)...")
     car_names = read_car_names(pid, local_slot, local_car_name)
     for p in players:
         if p.is_local:
@@ -2202,19 +2265,20 @@ def read_tuning_for_race(pid: int, car_name: str) -> dict:
 # ── output ────────────────────────────────────────────────────────────────────
 def _race_results_table_str(race: RaceResult, width: int = 82) -> str:
     """Plain-text results table -- header/rule/rows/closing rule, matching
-    print_table()'s own table body exactly (factored out so it can also be
-    reused for the API payload's `notes` field -- see _race_to_api_payload).
+    print_table()'s own table body exactly. Console-output only as of the
+    "roster" merge -- the API payload used to reuse this same string as its
+    `notes` field, but that's been replaced by the structured
+    `results_roster` field (see _race_to_api_payload), which carries DNF
+    status and per-racer stats as real JSON rather than a rendered table.
     Player names are already color-code-stripped at read time (see
     _strip_color_codes()), so this comes out clean with no extra work here.
 
     The trailing STATUS column carries "DNF" for any racer the engine flagged
-    as not finishing (STATUS_DNF_BIT -- see OFF_STATUS_FLAGS). Because this
-    same render is what gets posted as the API payload's `notes`, marking it
-    here is what puts DNF status into the posted comment, not just the
-    console. Rows stay in ranked order either way: DNFs are sorted below
-    every finisher by _position_sort_key() and keep their real position
-    number, so the column annotates the ranking rather than replacing it.
-    Width widened from 76 to fit the extra column."""
+    as not finishing (STATUS_DNF_BIT -- see OFF_STATUS_FLAGS). Rows stay in
+    ranked order either way: DNFs are sorted below every finisher by
+    _position_sort_key() and keep their real position number, so the column
+    annotates the ranking rather than replacing it. Width widened from 76 to
+    fit the extra column."""
     lines = [
         f"  {'POS':<4} {'NAME':<20} {'CAR':<18} {'CLASS':<7} {'BEST LAP':<11} {'TOTAL':<11} STATUS",
         f"  {'-' * (width - 2)}",
@@ -2226,11 +2290,10 @@ def _race_results_table_str(race: RaceResult, width: int = 82) -> str:
                       f"{'DNF' if p.dnf else ''}".rstrip())
     lines.append("=" * width)
     # Per-lap splits for the local player, when live accumulation captured a
-    # validated full set (see resolve_lap_splits). Rendered here rather than
-    # as a separate API field because this same string is the payload's
-    # `notes`, so it reaches the backend with no schema change -- and the
-    # endpoint answers HTTP 200 even on validation failure, which makes
-    # adding an unagreed field a silent-failure risk.
+    # validated full set (see resolve_lap_splits). Console display only --
+    # the API sends the same splits separately via the structured
+    # `lap_times_ms` field (see _race_to_api_payload), not through this
+    # rendered string.
     local = next((p for p in race.players if p.is_local), None)
     if local is not None and local.lap_times_ms:
         splits = "  ".join(f"L{i+1} {ms_to_str(t)}"
@@ -2271,8 +2334,6 @@ def _player_to_dict(p: PlayerResult, include_laps: bool = True) -> dict:
         "class":         p.class_str(),
         "best_lap_ms":   p.best_lap_ms,
         "total_time_ms": p.total_time_ms,
-        "best_lap":      ms_to_str(p.best_lap_ms),
-        "total_time":    ms_to_str(p.total_time_ms),
 
         # Engine's own DNF flag (STATUS_DNF_BIT) -- not inferred from times.
         # Every racer is in this payload now, including those who completed
@@ -2367,19 +2428,15 @@ def _race_to_api_payload(race: RaceResult) -> Optional[dict]:
         "gear_ratio":        tuning_1indexed("GEARING"),
         "differential":      tuning_1indexed("DIFFERENTIAL"),
         "brake_balance":     tuning_1indexed("BRAKES"),
-        # Race configuration and the local player's per-lap splits, added at
-        # user request 2026-08-16. NOTE: these are NEW fields on a payload
-        # that was previously flat scalars only. The endpoint answers HTTP
-        # 200 even for validation failures, so a backend that rejects unknown
-        # fields would fail SILENTLY -- the first real post after this change
-        # must be checked for the in-body "success", not just the status code.
         "lap_count":         race.lap_count or None,
         "lap_times_ms":      list(local.lap_times_ms) or None,
-        # Full field/finishing-order table, per user request 2026-08-08 --
-        # same plain-text render used for console output (_race_results_table_str,
-        # shared with print_table()). Names are already color-code-stripped
-        # at read time, so this needs no extra cleanup here.
-        "notes":             _race_results_table_str(race),
+        # Structured finishing-order roster: all racers sorted by position.
+        # Lap splits omitted per-entry -- local player's are already sent
+        # separately as lap_times_ms above.
+        "results_roster":    sorted(
+            [_player_to_dict(p, include_laps=False) for p in race.players],
+            key=lambda d: d["position"],
+        ),
     }
     for key, value in optional_fields.items():
         if value is not None:
@@ -2686,8 +2743,8 @@ def _race_is_final(players: list, pid: Optional[int] = None) -> bool:
     #     the race ran on.
     #   - "the LOCAL player's own run is over" is better but still early: it
     #     fires the moment the local player finishes, capturing every other
-    #     racer mid-race. Their rows -- and the API `notes` roster built from
-    #     them -- are then not final results.
+    #     racer mid-race. Their rows -- and the API `results_roster` built
+    #     from them -- are then not final results.
     #
     # `_STILL_RACING_COUNT` is what makes this reliable; see its comment for
     # why the returned player list alone cannot answer "is anyone still out
